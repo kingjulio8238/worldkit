@@ -13,7 +13,7 @@ match can be played inside the model at 20 FPS on a single GPU. Play it live at
 [mira-wm.com](https://mira-wm.com).
 
 This is the official code release for the technical report:<br>
-[MIRA: Multiplayer Interactive World Models with Representation Autoencoders](https://github.com/mira-wm/mira), a collaboration between<br>
+[MIRA: Multiplayer Interactive World Models with Representation Autoencoders](https://arxiv.org/abs/2607.05352), a collaboration between<br>
 [General Intuition](https://www.generalintuition.com), [Kyutai](https://kyutai.org), and [Epic Games](https://www.epicgames.com/site/home).
 
 <img width="1491" height="533" alt="architecture" src="https://github.com/user-attachments/assets/4f0fa7c7-aa27-48ed-9b08-4ebaade65f4d" />
