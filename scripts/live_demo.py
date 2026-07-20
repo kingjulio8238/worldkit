@@ -202,7 +202,8 @@ def _load_models(device):
     seeds = []
     for _ in range(4):
         try:
-            seeds.append(next(it))
+            item = next(it)  # the loader yields (VideoActionBatch, metadata) tuples
+            seeds.append(item[0] if isinstance(item, (tuple, list)) else item)
         except StopIteration:
             break
 
