@@ -3,11 +3,12 @@ real time, toggling between our optimized inference (2-step PSD + torch.compile 
 released baseline (10-step base, eager) — with a live, server-measured speed/cost HUD.
 
 It is legit end-to-end: a real H100 holds both real checkpoints warm, bootstraps from a real
-rocket-science clip, and streams actual generated frames over a WebSocket as you press keys. The HUD
-numbers are measured on the GPU per frame (torch.cuda.Event), not scripted.
+rocket-science clip, and streams actual generated frames as you press keys. The HUD numbers are
+measured on the GPU per frame (torch.cuda.Event), not scripted. Transport is HTTP polling (one POST
+per frame) — robust on Modal's runtime; the per-frame GPU time is what the HUD reports.
 
     modal serve scripts/live_demo.py     # dev: prints a *.modal.run URL, open it, drive with WASD
-    modal deploy scripts/live_demo.py    # persistent URL
+    modal deploy scripts/live_demo.py    # persistent URL (run `modal app stop mira-live-demo` when done)
 
 Controls: W/A/S/D drive, Q/E air-roll, Space ball-cam, Shift boost/powerslide, Ctrl. Buttons toggle
 Ours vs Released and reset the world. See docs/optimization_plan.md (E2) for the ~7x result.
@@ -49,8 +50,7 @@ image = (
                    ignore=["**/.git", "**/.pixi", "**/__pycache__", "**/*.lock", "**/.pytest_cache",
                            "**/.benchmarks"])
     .run_commands(f"pip install -e '{REMOTE_REPO}[train]'")
-    # ASGI + WebSocket serving stack.
-    .pip_install("fastapi", "uvicorn[standard]", "websockets")
+    .pip_install("fastapi", "uvicorn[standard]")
     .run_function(_prefetch_dino)
 )
 
@@ -130,10 +130,6 @@ class LiveSession:
         new.mouse_movements = torch.zeros((1, self.td, 2), dtype=torch.float32, device=self.device)
         self.actions = self.actions.cat_time(new)
 
-    @property
-    def latent_fps_target(self) -> float:
-        return self.model.config.video.fps / self.td
-
     def step(self, keys: list[int]):
         """Denoise + decode one latent from the held keys; return (uint8 HWC frames, gpu_ms)."""
         torch = self.torch
@@ -152,21 +148,27 @@ class LiveSession:
         torch.cuda.synchronize()
         gpu_ms = start.elapsed_time(end)
 
-        # [-1,1] -> uint8 HWC. Send both td frames of the newest latent (smoother display).
-        vid = ((video[0].clamp(-1, 1) * 0.5 + 0.5) * 255).to(torch.uint8)  # (td, C, H, W)
-        frames = vid.permute(0, 2, 3, 1).contiguous().cpu().numpy()        # (td, H, W, C)
+        # [-1,1] -> uint8 HWC. Keep only the newest video frame for display.
+        vid = ((video[0, -1].clamp(-1, 1) * 0.5 + 0.5) * 255).to(torch.uint8)  # (C, H, W)
+        frame = vid.permute(1, 2, 0).contiguous().cpu().numpy()                # (H, W, C)
         self.frame_idx += 1
-        return frames, gpu_ms
+        # Trim the action history so it can't grow unbounded over a long session.
+        keep = (self.window + 2) * self.td
+        if self.actions.key_presses.shape[1] > keep:
+            self.actions = self.actions.slice_time(-keep, None)
+        return frame, gpu_ms
 
 
 # --------------------------------------------------------------------------- model loading
 
 
 def _load_models(device):
-    """Load the PSD (optimized) and base (baseline) checkpoints + build a couple of seed clips."""
+    """Load the PSD (optimized) and base (baseline) checkpoints + build a few real seed clips."""
+    import glob
+    import sys
+
     import torch  # noqa: PLC0415
 
-    import sys
     sys.path.insert(0, f"{REMOTE_REPO}/scripts")
     from eval_world_model_offline import _build_loader, load_run_config  # noqa: PLC0415
 
@@ -174,11 +176,9 @@ def _load_models(device):
     from mira.world_model.config import WorldModelInferenceConfig  # noqa: PLC0415
 
     def _local_codec(ckpt: str):
-        import glob
         hits = sorted(glob.glob(f"{Path(ckpt).parents[1]}/codec/**/checkpoint.pth", recursive=True))
         return hits[0] if hits else None
 
-    # Optimized: 2-step PSD + compile + CUDA graphs. Baseline: 10-step base, eager, no graphs.
     opt_model, _ = load_world_model(Path(PSD_CKPT), device=device, codec_checkpoint=_local_codec(PSD_CKPT))
     base_model, _ = load_world_model(Path(BASE_CKPT), device=device, codec_checkpoint=_local_codec(BASE_CKPT))
     opt_model.eval()
@@ -191,7 +191,6 @@ def _load_models(device):
     base_cfg = WorldModelInferenceConfig(n_diffusion_steps=10, schedule_type="linear_quadratic",
                                          noise_level=0.2, streaming_cache="grow", cuda_graphs=False)
 
-    # Seed clips from the real test split (bootstrap the world so it starts coherent).
     cfg = load_run_config(Path(PSD_CKPT))
     cfg.dataset.test_index = DATA_INDEX
     clip_len = (opt_model.n_context_latents + 2) * opt_model.temporal_downsampling
@@ -210,88 +209,85 @@ def _load_models(device):
 
 # --------------------------------------------------------------------------- ASGI app
 
+SESSION = None  # one interactive session per (single) container
 
-@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=3600, min_containers=1,
-              max_containers=1)
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=3600,
+              min_containers=1, max_containers=1)
 @modal.concurrent(max_inputs=1)  # shared CUDA-graph buffers -> one interactive rollout per container
 @modal.asgi_app()
 def web():
     import base64
     import io
-    import time
+    import traceback
 
     import torch
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI
     from fastapi.responses import HTMLResponse
     from PIL import Image
+    from pydantic import BaseModel
 
     device = torch.device("cuda")
-    print("Loading models (this warms both checkpoints + compiles the optimized path)...", flush=True)
+    print("Loading models (this warms both checkpoints)...", flush=True)
     models, seeds = _load_models(device)
-    print(f"Ready: {len(seeds)} seed clips, H100 ${H100_USD_PER_HR}/hr.", flush=True)
+
+    global SESSION
+    SESSION = LiveSession(models, seeds, device)
+    # Warm at startup so the first user interaction is snappy: this triggers the optimized-path compile
+    # + graph capture and the baseline eager path. Any bug in step()/decode surfaces HERE, before the
+    # URL goes live -- read the logs above "Ready:".
+    print("Warming optimized path (torch.compile + CUDA-graph capture, ~1-2 min)...", flush=True)
+    for _ in range(2):
+        SESSION.step([])
+    SESSION.set_mode("baseline")
+    SESSION.step([])
+    SESSION.set_mode("optimized")
+    print("Ready. URL is live; drive with WASD.", flush=True)
 
     fapp = FastAPI()
 
+    class StepReq(BaseModel):
+        keys: list[int] = []
+        cmd: str | None = None
+        mode: str | None = None
+
     @fapp.get("/")
-    async def index():
+    def index():
         return HTMLResponse(HTML)
 
-    @fapp.websocket("/ws")
-    async def ws(websocket: WebSocket):
-        await websocket.accept()
-        session = LiveSession(models, seeds, device)
-        # Warm the current mode (first compile/graph capture) so the first shown frame isn't the spike.
+    # Sync endpoint -> FastAPI runs it in a threadpool, so the GPU step never blocks the event loop.
+    @fapp.post("/step")
+    def step(req: StepReq):
         try:
-            session.step([])
-        except Exception as exc:  # noqa: BLE001
-            print(f"warmup error: {exc}", flush=True)
-        try:
-            while True:
-                msg = await websocket.receive_json()
-                cmd = msg.get("cmd")
-                if cmd == "mode":
-                    session.set_mode(msg.get("mode", "optimized"))
-                    session.step([])  # warm the newly selected mode
-                    await websocket.send_json({"event": "mode", "mode": session.mode})
-                    continue
-                if cmd == "reset":
-                    session.reset()
-                    await websocket.send_json({"event": "reset"})
-                    continue
-                if cmd == "seed":
-                    session.next_seed()
-                    await websocket.send_json({"event": "seed", "idx": session.seed_idx})
-                    continue
+            if req.cmd == "mode":
+                SESSION.set_mode(req.mode or "optimized")
+                SESSION.step([])  # recapture graph for the newly selected mode
+                return {"event": "mode", "mode": SESSION.mode}
+            if req.cmd == "reset":
+                SESSION.reset()
+                return {"event": "reset"}
+            if req.cmd == "seed":
+                SESSION.next_seed()
+                return {"event": "seed", "idx": SESSION.seed_idx}
 
-                keys = msg.get("keys", [])
-                frames, gpu_ms = session.step(keys)
-                # Encode the newest video frame as JPEG (send the last of the td frames).
-                img = Image.fromarray(frames[-1])
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=80)
-                b64 = base64.b64encode(buf.getvalue()).decode()
+            frame, gpu_ms = SESSION.step(req.keys)
+            img = Image.fromarray(frame)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            b64 = base64.b64encode(buf.getvalue()).decode()
 
-                gen_fps = 1000.0 / gpu_ms * session.td            # video frames/s the GPU sustains
-                x_realtime = gen_fps / session.model.config.video.fps
-                frames_per_usd = gen_fps * 3600.0 / H100_USD_PER_HR
-                await websocket.send_json({
-                    "frame": b64,
-                    "mode": session.mode,
-                    "gpu_ms": round(gpu_ms, 1),
-                    "gen_fps": round(gen_fps, 1),
-                    "x_realtime": round(x_realtime, 2),
-                    "frames_per_usd": int(frames_per_usd),
-                    "n_steps": session.cfg.n_diffusion_steps,
-                })
-        except WebSocketDisconnect:
-            return
+            gen_fps = 1000.0 / gpu_ms * SESSION.td
+            x_realtime = gen_fps / SESSION.model.config.video.fps
+            frames_per_usd = gen_fps * 3600.0 / H100_USD_PER_HR
+            return {
+                "frame": b64, "mode": SESSION.mode,
+                "gpu_ms": round(gpu_ms, 1), "gen_fps": round(gen_fps, 1),
+                "x_realtime": round(x_realtime, 2), "frames_per_usd": int(frames_per_usd),
+                "n_steps": SESSION.cfg.n_diffusion_steps,
+            }
         except Exception as exc:  # noqa: BLE001 -- surface errors to the client for live debugging
-            import traceback
             traceback.print_exc()
-            try:
-                await websocket.send_json({"event": "error", "detail": f"{type(exc).__name__}: {exc}"})
-            except Exception:
-                pass
+            return {"event": "error", "detail": f"{type(exc).__name__}: {exc}"}
 
     return fapp
 
@@ -299,7 +295,7 @@ def web():
 # --------------------------------------------------------------------------- browser UI
 
 HTML = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>MIRA-Mini — live</title>
+<html><head><meta charset="utf-8"><title>MIRA-Mini - live</title>
 <style>
   :root { color-scheme: dark; }
   body { margin:0; background:#0b0d10; color:#e8eef2; font:14px/1.4 ui-sans-serif,system-ui,sans-serif;
@@ -308,7 +304,7 @@ HTML = r"""<!doctype html>
   .sub { color:#8a97a3; margin:0 0 6px; }
   #stage { position:relative; width:640px; max-width:96vw; aspect-ratio:16/9; background:#000;
            border:1px solid #22282e; border-radius:10px; overflow:hidden; }
-  canvas { width:100%; height:100%; image-rendering:auto; display:block; }
+  canvas { width:100%; height:100%; display:block; }
   #hud { position:absolute; top:10px; left:10px; display:grid; grid-template-columns:auto auto; gap:2px 14px;
          background:rgba(8,10,13,.72); padding:10px 14px; border-radius:8px; font-variant-numeric:tabular-nums;
          backdrop-filter:blur(4px); }
@@ -326,35 +322,34 @@ HTML = r"""<!doctype html>
   kbd { background:#161b21; border:1px solid #2a323a; border-bottom-width:2px; border-radius:4px;
         padding:1px 6px; color:#cdd7df; }
   #status { color:#8a97a3; min-height:18px; }
-  .cmp { display:flex; gap:24px; color:#8a97a3; font-size:12px; }
-  .cmp b { color:#e8eef2; }
+  .cmp { color:#8a97a3; font-size:12px; } .cmp b { color:#e8eef2; }
 </style></head>
 <body>
-  <h1>MIRA-Mini · live world model</h1>
+  <h1>MIRA-Mini &middot; live world model</h1>
   <p class="sub">Drive it. Toggle our optimized inference vs the released baseline. Metrics measured on the H100.</p>
   <div id="stage">
     <canvas id="cv" width="640" height="360"></canvas>
-    <div id="badge" class="badge opt">OURS · 2-step PSD + graphs</div>
+    <div id="badge" class="badge opt">OURS &middot; 2-step PSD + graphs</div>
     <div id="hud">
-      <div class="k big">gen fps</div><div class="v big" id="fps">–</div>
-      <div class="k">ms / frame</div><div class="v" id="ms">–</div>
-      <div class="k">× realtime</div><div class="v" id="rt">–</div>
-      <div class="k">frames / $</div><div class="v" id="fpd">–</div>
-      <div class="k">diffusion steps</div><div class="v" id="steps">–</div>
+      <div class="k big">gen fps</div><div class="v big" id="fps">-</div>
+      <div class="k">ms / frame</div><div class="v" id="ms">-</div>
+      <div class="k">x realtime</div><div class="v" id="rt">-</div>
+      <div class="k">frames / $</div><div class="v" id="fpd">-</div>
+      <div class="k">diffusion steps</div><div class="v" id="steps">-</div>
     </div>
   </div>
   <div class="row">
-    <button id="btn-opt" class="on">⚡ Ours (2-step PSD + graphs)</button>
-    <button id="btn-base">🐌 Released (10-step, eager)</button>
-    <button id="btn-reset">↺ Reset world</button>
-    <button id="btn-seed">⇢ New scene</button>
+    <button id="btn-opt" class="on">Ours (2-step PSD + graphs)</button>
+    <button id="btn-base">Released (10-step, eager)</button>
+    <button id="btn-reset">Reset world</button>
+    <button id="btn-seed">New scene</button>
   </div>
   <div class="cmp" id="cmp"></div>
   <div class="keys">
-    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive ·
-    <kbd>Q</kbd><kbd>E</kbd> air-roll · <kbd>Space</kbd> ball-cam · <kbd>Shift</kbd> boost · <kbd>Ctrl</kbd>
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive &middot;
+    <kbd>Q</kbd><kbd>E</kbd> air-roll &middot; <kbd>Space</kbd> ball-cam &middot; <kbd>Shift</kbd> boost &middot; <kbd>Ctrl</kbd>
   </div>
-  <div id="status">connecting…</div>
+  <div id="status">connecting...</div>
 <script>
 // Key vocab order must match DEFAULT_RL_KEYS in mira/data/actions.py.
 const VOCAB = ["W","A","S","D","Q","E","Space","LShiftKey","LControlKey"];
@@ -364,67 +359,61 @@ const CODE2KEY = {KeyW:"W",KeyA:"A",KeyS:"S",KeyD:"D",KeyQ:"Q",KeyE:"E",
 const held = new Set();
 const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
 const img = new Image();
-const S = {best:{opt:null,base:null}};
+const best = {opt:null, base:null};
 const $ = id => document.getElementById(id);
+let mode = "optimized", running = true;
 
 function keyIdxs(){ return [...held].map(k => VOCAB.indexOf(k)).filter(i => i>=0); }
-
 addEventListener("keydown", e => { const k=CODE2KEY[e.code]; if(k){ held.add(k); e.preventDefault(); }});
 addEventListener("keyup",   e => { const k=CODE2KEY[e.code]; if(k){ held.delete(k); e.preventDefault(); }});
 
-const proto = location.protocol === "https:" ? "wss" : "ws";
-const ws = new WebSocket(`${proto}://${location.host}/ws`);
-let inflight = false, mode = "optimized";
-
-ws.onopen = () => { $("status").textContent = "connected — click the canvas and drive with WASD"; tick(); };
-ws.onclose = () => { $("status").textContent = "disconnected"; };
-ws.onmessage = ev => {
-  const m = JSON.parse(ev.data);
-  if(m.event === "error"){ $("status").textContent = "server error: " + m.detail; inflight=false; return; }
-  if(m.event){ inflight=false; return; }         // mode/reset/seed acks
-  if(m.frame){
-    img.onload = () => ctx.drawImage(img, 0, 0, cv.width, cv.height);
-    img.src = "data:image/jpeg;base64," + m.frame;
-    $("fps").textContent = m.gen_fps.toFixed(1);
-    $("ms").textContent  = m.gpu_ms.toFixed(1) + " ms";
-    $("rt").textContent  = m.x_realtime.toFixed(2) + "×";
-    $("fpd").textContent = m.frames_per_usd.toLocaleString();
-    $("steps").textContent = m.n_steps;
-    S.best[mode==="optimized"?"opt":"base"] = m;
-    renderCmp();
-  }
-  inflight = false;
-};
-
-function renderCmp(){
-  const o = S.best.opt, b = S.best.base;
+async function post(body){
+  const r = await fetch("/step", {method:"POST", headers:{"Content-Type":"application/json"},
+                                  body: JSON.stringify(body)});
+  return r.json();
+}
+function draw(m){
+  img.onload = () => ctx.drawImage(img, 0, 0, cv.width, cv.height);
+  img.src = "data:image/jpeg;base64," + m.frame;
+  $("fps").textContent = m.gen_fps.toFixed(1);
+  $("ms").textContent  = m.gpu_ms.toFixed(1) + " ms";
+  $("rt").textContent  = m.x_realtime.toFixed(2) + "x";
+  $("fpd").textContent = m.frames_per_usd.toLocaleString();
+  $("steps").textContent = m.n_steps;
+  best[mode==="optimized"?"opt":"base"] = m;
+  const o = best.opt, b = best.base;
   if(o && b){
-    const sx = (o.gen_fps / b.gen_fps).toFixed(1);
-    const cx = (o.frames_per_usd / b.frames_per_usd).toFixed(1);
-    $("cmp").innerHTML = `Ours vs Released: <b>${sx}× faster</b> (${o.gen_fps}→ vs ${b.gen_fps} fps) · `
-                       + `<b>${cx}× more frames per dollar</b>`;
+    $("cmp").innerHTML = "Ours vs Released: <b>" + (o.gen_fps/b.gen_fps).toFixed(1) + "x faster</b> ("
+      + o.gen_fps + " vs " + b.gen_fps + " fps) &middot; <b>"
+      + (o.frames_per_usd/b.frames_per_usd).toFixed(1) + "x more frames per dollar</b>";
   }
 }
-
-function tick(){
-  if(ws.readyState === 1 && !inflight){ inflight = true; ws.send(JSON.stringify({keys: keyIdxs()})); }
-  requestAnimationFrame(tick);
+async function loop(){
+  $("status").textContent = "connected - click the page and drive with WASD";
+  while(running){
+    try {
+      const m = await post({keys: keyIdxs()});
+      if(m.event === "error"){ $("status").textContent = "server error: " + m.detail; await sleep(1000); }
+      else if(m.frame){ draw(m); }
+    } catch(e){ $("status").textContent = "network error: " + e; await sleep(500); }
+  }
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function setMode(m){
-  mode = m; inflight = true;
-  ws.send(JSON.stringify({cmd:"mode", mode:m}));
+async function setMode(m){
+  mode = m;
+  await post({cmd:"mode", mode:m});
   const opt = m === "optimized";
   $("btn-opt").classList.toggle("on", opt); $("btn-base").classList.toggle("on", !opt);
   const badge = $("badge");
   badge.className = "badge " + (opt ? "opt" : "base");
-  badge.textContent = opt ? "OURS · 2-step PSD + graphs" : "RELEASED · 10-step, eager";
+  badge.textContent = opt ? "OURS - 2-step PSD + graphs" : "RELEASED - 10-step, eager";
 }
 $("btn-opt").onclick  = () => setMode("optimized");
 $("btn-base").onclick = () => setMode("baseline");
-$("btn-reset").onclick= () => { inflight=true; ws.send(JSON.stringify({cmd:"reset"})); };
-$("btn-seed").onclick = () => { inflight=true; ws.send(JSON.stringify({cmd:"seed"})); };
-cv.tabIndex = 0;
+$("btn-reset").onclick= () => post({cmd:"reset"});
+$("btn-seed").onclick = () => post({cmd:"seed"});
+loop();
 </script>
 </body></html>
 """
