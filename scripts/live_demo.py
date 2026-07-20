@@ -281,10 +281,8 @@ def web():
 
     def _panel(session, keys: list[int]) -> dict:
         frame, ms = session.step(keys)
-        img = Image.fromarray(frame)
-        img.thumbnail((480, 480))  # cap the shipped JPEG size
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=72)
+        Image.fromarray(frame).save(buf, format="JPEG", quality=90)  # native res, high quality (sharper)
         ms = max(float(ms), 0.1)   # guard a 0 that would make fps non-finite (invalid JSON)
         fps = 1000.0 / ms * session.td
         return {
@@ -306,7 +304,14 @@ def web():
                 OPT_SESSION.next_seed(); BASE_SESSION.next_seed()
                 return {"event": "seed", "idx": OPT_SESSION.seed_idx}
             keys = body.get("keys", [])
-            # Same keys drive both -> same scene, diverging only by model + step count.
+            # Same keys drive both -> same scene, diverging only by model + step count. `which` lets the
+            # client poll each panel on its own loop (OURS flat-out, RELEASED throttled) so OURS stays
+            # reactive instead of both being bottlenecked by the baseline's ~200ms step.
+            which = body.get("which")
+            if which == "opt":
+                return {"opt": _panel(OPT_SESSION, keys)}
+            if which == "base":
+                return {"base": _panel(BASE_SESSION, keys)}
             return {"opt": _panel(OPT_SESSION, keys), "base": _panel(BASE_SESSION, keys)}
         except Exception as exc:  # noqa: BLE001 -- surface errors to the client instead of a blank frame
             traceback.print_exc()
@@ -436,31 +441,41 @@ async function post(body){
                                   body: JSON.stringify(body)});
   return r.json();
 }
+const best = {opt:null, base:null};
+function updateSummary(){
+  const o = best.opt, b = best.base;
+  if(o && b){
+    $("summary").innerHTML = "Ours generates <b class='hi'>" + (o.fps/b.fps).toFixed(1)
+      + "&times; more frames per second</b> and <b class='hi'>" + (o.fpd/b.fpd).toFixed(1)
+      + "&times; more frames per dollar</b> &mdash; " + o.steps + " diffusion steps vs " + b.steps + ".";
+  }
+}
 function paint(which, m){
   imgs[which].src = "data:image/jpeg;base64," + m.frame;
   $(which+"-fps").textContent = m.fps.toFixed(1);
   $(which+"-ms").textContent  = m.ms.toFixed(1);
   $(which+"-rt").textContent  = m.rt.toFixed(2) + "x";
   $(which+"-fpd").textContent = m.fpd >= 1000 ? Math.round(m.fpd/1000) + "k" : m.fpd;
+  best[which] = m;
+  updateSummary();
+  $("status").textContent = "live — driving with WASD";
 }
-async function loop(){
-  $("status").textContent = "live - click the page and drive with WASD";
+// Independent loops: OURS runs flat-out (stays reactive); RELEASED is throttled so it doesn't hog the
+// single GPU (and visibly lags, which is the whole point). The same held keys drive both.
+async function runLoop(which, throttle){
   while(running){
     try {
-      const r = await post({keys: keyIdxs()});
-      if(r.event === "error"){ $("status").textContent = "server error: " + r.detail; await sleep(1000); continue; }
-      if(r.opt && r.base){
-        paint("opt", r.opt); paint("base", r.base);
-        const sx = (r.opt.fps / r.base.fps).toFixed(1), cx = (r.opt.fpd / r.base.fpd).toFixed(1);
-        $("summary").innerHTML = "Ours generates <b class='hi'>" + sx + "&times; more frames per second</b> and <b class='hi'>"
-          + cx + "&times; more frames per dollar</b> &mdash; " + r.opt.steps + " diffusion steps vs " + r.base.steps + ".";
-      }
-    } catch(e){ $("status").textContent = "network error: " + e; await sleep(500); }
+      const r = await post({which, keys: keyIdxs()});
+      if(r && r[which] && r[which].frame) paint(which, r[which]);
+      else if(r && r.event === "error"){ $("status").textContent = "server error: " + r.detail; await sleep(800); }
+    } catch(e){ $("status").textContent = "reconnecting…"; await sleep(400); }
+    if(throttle) await sleep(throttle);
   }
 }
 $("btn-reset").onclick = () => post({cmd:"reset"});
 $("btn-seed").onclick  = () => post({cmd:"seed"});
-loop();
+runLoop("opt", 0);      // OURS: as fast as the network + 2-step model allow
+runLoop("base", 300);   // RELEASED: throttled ~3/s so it can't starve OURS
 </script>
 </body></html>
 """
