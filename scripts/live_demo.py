@@ -261,7 +261,40 @@ def web():
     BASE_SESSION.step([])
     print("Ready. URL is live; drive with WASD.", flush=True)
 
+    from fastapi.exceptions import RequestValidationError
+
     fapp = FastAPI()
+
+    # ---- verbose debug instrumentation -------------------------------------------------------------
+    @fapp.middleware("http")
+    async def _log_mw(request: Request, call_next):
+        print(f"[MW] --> {request.method} {request.url.path} "
+              f"ct={request.headers.get('content-type')!r} cl={request.headers.get('content-length')!r}",
+              flush=True)
+        try:
+            resp = await call_next(request)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[MW] !! EXCEPTION in {request.url.path}: {type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
+            raise
+        clen = resp.headers.get("content-length")
+        print(f"[MW] <-- {request.method} {request.url.path} -> {resp.status_code} "
+              f"media={resp.media_type!r} clen={clen}", flush=True)
+        return resp
+
+    @fapp.exception_handler(RequestValidationError)
+    async def _veh(request: Request, exc: RequestValidationError):
+        raw = await request.body()
+        print(f"[422] RequestValidationError {request.url.path}: {exc.errors()} raw={raw[:300]!r}",
+              flush=True)
+        return JSONResponse(status_code=422, content={"event": "error", "detail": str(exc.errors())})
+
+    @fapp.exception_handler(Exception)
+    async def _geh(request: Request, exc: Exception):
+        print(f"[ERR] unhandled {request.url.path}: {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"event": "error", "detail": str(exc)})
+    # ------------------------------------------------------------------------------------------------
 
     @fapp.get("/")
     def index():
@@ -271,26 +304,38 @@ def web():
     def ping():
         return JSONResponse({"ok": True, "ready": OPT_SESSION is not None})
 
-    def _panel(session, keys: list[int]) -> dict:
+    @fapp.post("/echo")
+    def echo(request: Request):
+        # No model, tiny fixed response -> isolates transport (does ANY POST round-trip work?).
+        return JSONResponse({"ok": True, "echo": True})
+
+    def _panel(session, keys: list[int], tag: str, want_frame: bool = True) -> dict:
         frame, ms = session.step(keys)
-        img = Image.fromarray(frame)
-        img.thumbnail((480, 480))  # cap payload size (the JPEG is what gets shipped each frame)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=72)
-        ms = max(float(ms), 0.1)   # guard against a 0 that would make fps non-finite (invalid JSON)
+        b64 = ""
+        if want_frame:
+            img = Image.fromarray(frame)
+            img.thumbnail((480, 480))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=72)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+        ms = max(float(ms), 0.1)
         fps = 1000.0 / ms * session.td
-        return {
-            "frame": base64.b64encode(buf.getvalue()).decode(),
-            "ms": round(ms, 1), "fps": round(fps, 1),
+        out = {
+            "frame": b64, "ms": round(ms, 1), "fps": round(fps, 1),
             "rt": round(fps / float(session.model.config.video.fps), 2),
             "fpd": int(fps * 3600.0 / H100_USD_PER_HR),
             "steps": int(session.cfg.n_diffusion_steps),
         }
+        print(f"[PANEL {tag}] frame={frame.shape} dtype={frame.dtype} jpeg_b64={len(b64)}B "
+              f"ms={out['ms']} fps={out['fps']} types={[type(v).__name__ for v in out.values()]}",
+              flush=True)
+        return out
 
     def _process(body: dict) -> dict:
         """All the (blocking) GPU work; run in a threadpool so the event loop stays free."""
         try:
             cmd = body.get("cmd")
+            print(f"[PROC] cmd={cmd!r} keys={body.get('keys')!r}", flush=True)
             if cmd == "reset":
                 OPT_SESSION.reset(); BASE_SESSION.reset()
                 return {"event": "reset"}
@@ -298,27 +343,29 @@ def web():
                 OPT_SESSION.next_seed(); BASE_SESSION.next_seed()
                 return {"event": "seed", "idx": OPT_SESSION.seed_idx}
             keys = body.get("keys", [])
-            # Same keys drive both -> same scene, diverging only by model + step count.
-            return {"opt": _panel(OPT_SESSION, keys), "base": _panel(BASE_SESSION, keys)}
+            want_frame = not body.get("noframe")  # POST {"noframe":true} -> metrics only (isolate payload)
+            return {"opt": _panel(OPT_SESSION, keys, "opt", want_frame),
+                    "base": _panel(BASE_SESSION, keys, "base", want_frame)}
         except Exception as exc:  # noqa: BLE001 -- surface errors to the client for live debugging
             traceback.print_exc()
             return {"event": "error", "detail": f"{type(exc).__name__}: {exc}"}
 
-    # Read the raw body ourselves (a Pydantic body-model 422'd through Modal's ASGI wrapper), offload
-    # the GPU work to a threadpool, and return an EXPLICIT JSONResponse (dumping with allow_nan=False so
-    # a stray inf/nan surfaces as a clean error instead of a malformed body Modal rejects with 422).
     @fapp.post("/step")
     async def step(request: Request):
+        raw = await request.body()
+        print(f"[STEP] raw_len={len(raw)} raw_head={raw[:120]!r}", flush=True)
         try:
-            raw = await request.body()
             body = json.loads(raw) if raw else {}
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            print(f"[STEP] body parse failed: {exc}", flush=True)
             body = {}
         result = await run_in_threadpool(_process, body)
         try:
             payload = json.dumps(result, allow_nan=False)
         except (ValueError, TypeError) as exc:
+            print(f"[STEP] serialize failed: {exc}", flush=True)
             payload = json.dumps({"event": "error", "detail": f"serialize: {exc}"})
+        print(f"[STEP] returning {len(payload)}B, keys={list(result.keys())}", flush=True)
         return JSONResponse(content=json.loads(payload))
 
     return fapp
