@@ -359,3 +359,70 @@ work (e.g. quantization in tier C). Net inference stack: `compile: true` + `rope
 - **No TF32 for inference** (bf16 matmuls).
 - Don't hand-fuse the elementwise *math* — `torch.compile` already did (45% → 2%); the residue is casts,
   which need fused norm/RoPE, not more elementwise work.
+
+---
+
+# E2 execution plan — adopt the 2-step PSD checkpoint (path to ~7×)
+
+The full-stack single-stream speedup so far is **~2.6×** vs the released eager baseline (compile + A3 +
+E1 CUDA graphs, all bit-exact). The remaining large lever is **algorithmic**: run **fewer diffusion
+steps**. The released default is **10 steps**; the base model degrades sharply below ~4–6 steps
+(arXiv 2607.05352 Fig 11), but the **`mira-mini-psd`** checkpoint (progressive self-distillation) holds
+quality down to **1–2 steps**. Stacking the two independent multipliers:
+
+| lever | needs | factor |
+|---|---|---|
+| step distillation 10 → 2 | `alakazamworld/mira-mini-psd` (public) | ~3.1× (173 → 55.6 ms eager) |
+| our engineering stack (compile + A3 + E1 graphs) | shipped | ~2.3× (55.6 → 24.1 ms) |
+| **combined** | both | **~7.2×** (173 ms 10-step-eager base → **24.1 ms** 2-step full-stack) |
+
+Baseline = released MIRA-**Mini** (1B, 10 steps, eager, compile off) ≈ 173 ms/frame (extrapolated from
+the measured 1/2/4/8-step curve). Target = 2-step PSD + full stack = **24.1 ms/frame (~41 fps, 4.1×
+realtime)**. All on **MIRA-Mini 1B**, not the 5B MIRA (unreleased). The *speed* is already measured
+(weight-agnostic); the gate is *quality* — proving 2-step PSD holds.
+
+## Phase 0 — Graph tier decision → **Tier B (chosen)**
+Because a PSD checkpoint feeds an extra per-step input (`tau_delta`, the integration step size,
+`latent_world_model.py:345`) to the denoiser, E1 CUDA graphs were guarded off for PSD. **Tier B** makes
+graphs work with PSD so the 2-step path reaches the full 24.1 ms (Tier A = compile+A3 only, ~27 ms).
+Chosen: **Tier B.** The `tau_delta` is derived from the already-static `delta_ts` inside the captured
+`_denoise_frame_body`, so the fix is to drop the conservative PSD guard (no new static buffer needed).
+- **Exit:** guard removed; `--psd` bench flag exercises the PSD inference path on random init.
+
+## Phase 1 — Stage assets on the volume  *(no paid GPU)*
+Dataset is **available (not gated)** for us. Download onto the `mira-bench-data` volume:
+- `alakazamworld/mira-mini` (base, `checkpoint-52000`) + `alakazamworld/mira-mini-psd` (2-step) — public HF.
+- rocket-science test split + a clip index (for the quality metrics loader).
+- DINOv3 backbone *weights* (the image bakes the *code* only).
+- **Exit:** `qualitycheck_steps` can `load_world_model` both checkpoints and `_build_loader` yields batches.
+
+## Phase 2 — Quality gate (the proof)  *(paid GPU, ~1–2 H100-hr)*
+Run `qualitycheck_steps` on base and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of
+10-step quality).
+- **Expect:** base min-viable ≈ 4–6; **PSD min-viable = 1–2.** That green-lights 2 steps.
+
+## Phase 3 — PSD graph wiring + correctness  *(Tier B code, done in Phase 0; verify here)*
+- `bench_infer_speed --compile --cuda-graphs --psd --verify-graphs` → **maxdiff 0.0** (PSD graphed ==
+  PSD eager), the same bar A3/E1 pass. Unit test: PSD-enabled graphed rollout == eager (CPU fallback).
+- **Exit:** bit-exact PSD graph path.
+
+## Phase 4 — Confirm headline speed  *(paid GPU, minutes)*
+- `modal run ...::infer --n-diffusion-steps "1 2" --compile --cuda-graphs` (+ `--psd`) →
+  2-step ≈ **24 ms/frame, ~4.1× realtime** — closes the ~7× claim on the PSD path.
+
+## Phase 5 — Make it the serving default  *(code + docs)*
+- Serving config: PSD checkpoint, `n_diffusion_steps=2`, `schedule_type=linear_quadratic`,
+  `noise_level=0.2`, `cuda_graphs=true`, compile on.
+- Document the 10-step-eager-base → 2-step-PSD-full-stack = ~7× result; commit + push to worldkit.
+
+## Status / critical path
+| phase | effort | GPU $ | blocker |
+|---|---|---|---|
+| 0 Tier B graphs | ~15 lines | none | — (done in code) |
+| 1 stage assets | low | none | — (dataset available) |
+| 2 quality gate | low | ~1–2 hr | PSD needing >2 steps (paper says no) |
+| 3 PSD graph verify | done | minutes | low |
+| 4 speed confirm | trivial | minutes | low (speed already measured) |
+| 5 defaults + docs | low | none | — |
+
+**Progress:** Phase 0 + Phase 1 (harness) implemented; Phases 2/4 await the paid `modal run`.

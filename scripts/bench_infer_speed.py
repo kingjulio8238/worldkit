@@ -46,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compile-mode", default="default", choices=["default", "reduce-overhead", "max-autotune"],
                    help="E1/A6: reduce-overhead enables CUDA-graph trees; max-autotune is A6")
     p.add_argument("--quantize", default="none", choices=["none", "int8", "fp8"], help="C1/C2 weight-only quant")
+    p.add_argument("--psd", action="store_true",
+                   help="E2/Tier B: build the model on the PSD inference path (feeds tau_delta) so graphs "
+                        "are exercised/verified as they run against a real mira-mini-psd checkpoint")
     return p.parse_args()
 
 
@@ -54,7 +57,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     bl.enable_tf32(args.tf32)
 
-    model = bl.build_random_world_model(size=args.size, device=device)
+    # --psd: turn on the PSD-M path so the transformer builds its tau_delta embedding and the denoise
+    # loop feeds tau_delta -- the inference control flow of a real mira-mini-psd checkpoint. psd_enabled
+    # is True whenever psd_weight>0; the training loss itself is never run here.
+    wm_overrides = {"psd_weight": 1.0} if args.psd else None
+    model = bl.build_random_world_model(size=args.size, device=device, wm_config_overrides=wm_overrides)
     model.eval()
     applied = apply_optims(model, parse_optim_spec(args.optim))
     quantized = apply_quantization(model, args.quantize)  # C: before compile (torchao+compile flow)
@@ -110,6 +117,7 @@ def main() -> None:
         "quantize": quantized,
         "streaming_cache": args.streaming_cache,
         "cuda_graphs": args.cuda_graphs,
+        "psd": args.psd,
         "compile_mode": args.compile_mode if args.compile else "eager",
         "latent_fps": round(latent_fps, 2),
         "rollout": [],

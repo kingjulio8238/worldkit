@@ -7,7 +7,9 @@ touches to live in **fixed buffers**: the ring KV-cache (B1) plus static input b
 
 Manual capture (not ``torch.compile(mode="reduce-overhead")``, which can't handle the KV-cache being a
 graph output). One graph is captured per ``(n_diffusion_steps, noise_level, schedule)``; the schedule
-is baked in. Single-player, ``n_register_tokens==0``, PSD off (guarded).
+is baked in. Single-player, ``n_register_tokens==0`` (guarded). PSD models are supported: their extra
+per-step ``tau_delta`` input is derived from the already-static ``delta_ts`` inside the captured body,
+so no dynamic input crosses the graph boundary.
 
 Everything is wrapped so any capture/replay failure **disables graphs and falls back to eager** — a
 broken capture never crashes the run, it just loses the speedup. Assumes one rollout at a time (the
@@ -55,8 +57,8 @@ class FrameGraphRunner:
         self.delta_ts = None
 
         cfg = model.config
-        if cfg.n_register_tokens != 0 or cfg.psd_enabled:
-            logger.warning("cuda_graphs unsupported (n_register_tokens!=0 or PSD on); falling back to eager.")
+        if cfg.n_register_tokens != 0:
+            logger.warning("cuda_graphs unsupported (n_register_tokens!=0); falling back to eager.")
             self.disabled = True
 
     def _body(self) -> None:

@@ -20,12 +20,15 @@ def test_runner_disabled_with_register_tokens():
     assert r.disabled is True
 
 
-def test_runner_disabled_with_psd():
+def test_runner_enabled_with_psd():
+    # Tier B: PSD is supported -- tau_delta is derived from the static delta_ts inside the captured
+    # body, so no dynamic input crosses the graph boundary. Bit-exactness is verified GPU-side via
+    # `bench_infer_speed --psd --verify-graphs`.
     r = FrameGraphRunner(_fake_model(psd_enabled=True), 4, 0.2, "linear")
-    assert r.disabled is True
+    assert r.disabled is False
 
 
 def test_disabled_runner_run_returns_none():
     # A disabled runner must signal eager fallback (return None) without touching CUDA.
-    r = FrameGraphRunner(_fake_model(psd_enabled=True), 4, 0.2, "linear")
+    r = FrameGraphRunner(_fake_model(n_register_tokens=2), 4, 0.2, "linear")
     assert r.run(None, None, None, None) is None

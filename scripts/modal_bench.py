@@ -64,6 +64,9 @@ image = (
     # FDD metric dep for the quality gate (scipy already comes via lpips). Not adding mira[eval]
     # wholesale because that would reinstall torchcodec from the default index over the cpu build.
     .pip_install("pytorch-fid")
+    # E2 Phase 1: pull the mira-mini / mira-mini-psd checkpoints and the rocket-science split from the
+    # Hub onto the volume (huggingface_hub is only an optional [hf] extra of the repo, so install it here).
+    .pip_install("huggingface_hub")
     # Category C: torchao weight-only int8/fp8 quantization. Pinned to a torch-2.8-era release so its
     # CUDA kernels match (the latest torchao targets torch>=2.11 and silently skips its cpp extensions,
     # which would make int8 fall back to a slow path). --no-deps keeps the cu128 torch build.
@@ -110,6 +113,7 @@ def infer(
     quantize: str = "none",
     cuda_graphs: bool = False,
     verify_graphs: bool = False,
+    psd: bool = False,
 ) -> None:
     """Rollout latency + decode throughput + end-to-end, over the diffusion-step sweep."""
     cmd = [
@@ -127,6 +131,8 @@ def infer(
         cmd.append("--cuda-graphs")
     if verify_graphs:
         cmd.append("--verify-graphs")
+    if psd:
+        cmd.append("--psd")
     if tf32:
         cmd.append("--tf32")
     if optim:
@@ -243,6 +249,94 @@ def qualitycheck_steps(checkpoint: str, n_diffusion_steps: str = "1 2 4 8 10", n
     if data_index:
         cmd += ["--data-index", data_index]
     _run(cmd)
+
+
+# --------------------------------------------------------------------------- E2 asset staging
+
+
+# Where staged assets live on the volume. Phase 2 (`qualitycheck_steps`) reads these paths.
+CKPT_DIR = "/data/checkpoints"
+DATA_DIR = "/data/datasets/rocket-science"
+# Public model repos (no gate). PSD is the 2-step distilled variant the E2 plan adopts.
+MODEL_REPOS = {"mira-mini": "alakazamworld/mira-mini", "mira-mini-psd": "alakazamworld/mira-mini-psd"}
+# The eval dataset. Gated on the Hub (CC-BY-NC-SA) -> the HF_TOKEN secret must have accepted the terms.
+DATASET_REPO = "kyutai/rocket-science"
+
+
+def _hf_snapshot(repo_id, local_dir, repo_type="model", allow_patterns=None):
+    """Download an HF repo snapshot straight onto the volume (local_dir, not the cache)."""
+    import os
+
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download(
+        repo_id, repo_type=repo_type, local_dir=local_dir, allow_patterns=allow_patterns,
+        token=os.environ.get("HF_TOKEN"),
+    )
+    return path
+
+
+@app.function(
+    volumes={"/data": data_vol},
+    timeout=10800,
+    # HF_TOKEN for the gated rocket-science dataset (and higher rate limits on the public checkpoints).
+    # Create it once: `modal secret create huggingface HF_TOKEN=hf_...` (a token whose account has
+    # accepted the kyutai/rocket-science terms). Rename here if your secret uses a different name.
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def stage_assets(checkpoints: bool = True, dataset: bool = True, dataset_split: str = "test") -> None:
+    """E2 Phase 1: stage the mira-mini / mira-mini-psd checkpoints + rocket-science split on the volume.
+
+    Idempotent (snapshot_download skips files already present). After it runs, use the printed paths
+    with `qualitycheck_steps` (Phase 2). No GPU. `--no-checkpoints` / `--no-dataset` to stage one side.
+    """
+    import glob
+
+    if checkpoints:
+        for name, repo in MODEL_REPOS.items():
+            dest = f"{CKPT_DIR}/{name}"
+            print(f"\n===== checkpoint {repo} -> {dest} =====", flush=True)
+            _hf_snapshot(repo, dest, repo_type="model")
+            found = sorted(glob.glob(f"{dest}/**/checkpoint*.pth", recursive=True))
+            print(f"  checkpoint files: {found or '(none found -- inspect repo layout)'}", flush=True)
+
+    if dataset:
+        print(f"\n===== dataset {DATASET_REPO} [{dataset_split}] -> {DATA_DIR} =====", flush=True)
+        # Only the requested split's prefix (index.json + its shards) -- the loader reads a split dir.
+        _hf_snapshot(DATASET_REPO, DATA_DIR, repo_type="dataset", allow_patterns=[f"{dataset_split}/*"])
+        split_dir = f"{DATA_DIR}/{dataset_split}"
+        has_index = glob.glob(f"{split_dir}/index.json")
+        print(f"  data-index dir: {split_dir}  (index.json present: {bool(has_index)})", flush=True)
+
+    data_vol.commit()
+    print("\nvolume committed. Phase 2 example:\n"
+          f"  modal run scripts/modal_bench.py::qualitycheck_steps \\\n"
+          f"    --checkpoint {CKPT_DIR}/mira-mini-psd/<checkpoint-XXXX>/checkpoint.pth \\\n"
+          f"    --n-diffusion-steps '1 2 4 8 10' --data-index {DATA_DIR}/{dataset_split}", flush=True)
+
+
+@app.function(volumes={"/data": data_vol}, timeout=1800)
+def verify_assets(dataset_split: str = "test") -> None:
+    """Sanity-check staged assets: list checkpoint files and confirm the split index loads."""
+    import glob
+
+    print("===== staged checkpoints =====", flush=True)
+    for name in MODEL_REPOS:
+        found = sorted(glob.glob(f"{CKPT_DIR}/{name}/**/checkpoint*.pth", recursive=True))
+        print(f"  {name}: {found or 'MISSING'}", flush=True)
+
+    print("\n===== staged dataset =====", flush=True)
+    split_dir = f"{DATA_DIR}/{dataset_split}"
+    idx = f"{split_dir}/index.json"
+    if glob.glob(idx):
+        from pathlib import Path
+
+        from mira.data.dataset import Index
+
+        loaded = Index.load(Path(idx))
+        print(f"  {split_dir}: index.json OK, {loaded.total_samples} samples", flush=True)
+    else:
+        print(f"  {split_dir}: MISSING index.json", flush=True)
 
 
 @app.function(gpu="H100", volumes={"/data": data_vol}, timeout=7200)
