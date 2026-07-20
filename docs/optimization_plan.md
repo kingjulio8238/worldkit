@@ -406,6 +406,11 @@ Two follow-ups this surfaced:
   **Inception-FID + latent-drift + LPIPS/PSNR/SSIM need no DINO weights and stay valid** as a fallback.
 - **62-sample test split** is small for Frechet stats — treat the curve as *relative* (base-vs-PSD,
   steps-vs-steps), and cap `--num-samples` at ~62 so the loader isn't asked for more clips than exist.
+- **Absolute codec path in the checkpoint config.** The released `world_model_config.yaml` bakes an
+  absolute `codec_checkpoint` from the author's machine (`/Users/hugohernandez/...`), which doesn't
+  exist on the volume. `load_world_model`/`LatentWorldModel.load_from_checkpoint` now take a
+  `codec_checkpoint` override, and `qualitycheck_steps` auto-detects the codec that ships alongside the
+  checkpoint (`<repo_root>/codec/checkpoint-*/checkpoint.pth`) — no manual path needed.
 
 ## Phase 2 — Quality gate (the proof)  *(paid GPU, ~1–2 H100-hr)*
 Run `qualitycheck_steps` on base and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of

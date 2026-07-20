@@ -47,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compile", action="store_true")
     p.add_argument("--data-index", default=None,
                    help="override the checkpoint config's dataset.test_index (e.g. the rocket-science test split)")
+    p.add_argument("--codec-checkpoint", default=None,
+                   help="override the config's (absolute, training-machine) codec_checkpoint. Default: "
+                        "auto-detect a codec/**/checkpoint.pth shipped alongside the world-model checkpoint.")
     p.add_argument("--exclude-metric-substr", nargs="*", default=[],
                    help="drop scalar-metric keys containing any of these substrings from the MIN-VIABLE "
                         "decision (the metrics still run). Pass 'dino fdd' when the DINOv3 metric weights "
@@ -82,8 +85,21 @@ def main() -> None:
         cfg.dataset.test_index = args.data_index
     wm_cfg = load_eval_metrics_config(num_samples=args.num_samples, no_compile=not args.compile)
 
+    # The config's codec_checkpoint is an absolute path from the training machine; override it with a
+    # local codec. Prefer an explicit --codec-checkpoint, else auto-detect the codec that ships in the
+    # checkpoint's own directory tree (repo_root/codec/checkpoint-*/checkpoint.pth).
+    codec_override = args.codec_checkpoint
+    if codec_override is None:
+        for anc in [checkpoint.parent, *checkpoint.parents]:
+            hits = sorted(anc.glob("codec/**/checkpoint.pth"))
+            if hits:
+                codec_override = str(hits[0])
+                break
+    if codec_override is not None:
+        print(f"  using codec_checkpoint: {codec_override}", flush=True)
+
     # One model, reused across step counts (the step count only changes the rollout sampler).
-    model, _ = load_world_model(checkpoint, device=device)
+    model, _ = load_world_model(checkpoint, device=device, codec_checkpoint=codec_override)
 
     steps_sorted = sorted(set(args.n_diffusion_steps))
     results: dict[int, dict[str, float]] = {}

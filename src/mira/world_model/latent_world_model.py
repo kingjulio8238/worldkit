@@ -614,6 +614,11 @@ class LatentWorldModel(nn.Module):
         config = LatentWorldModelConfig.model_validate(
             _config_dict_from_yaml(config_raw.model.architecture.config)
         )
+        # Released checkpoints bake an absolute codec_checkpoint from the training machine; allow the
+        # caller to point it at a local copy (the codec that ships alongside the checkpoint).
+        codec_override = kwargs.pop("codec_checkpoint", None)
+        if codec_override is not None:
+            config.codec_checkpoint = str(codec_override)
         model = cls(config)
         model.to(device)
 

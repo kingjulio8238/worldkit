@@ -11,13 +11,20 @@ if TYPE_CHECKING:
     from mira.world_model.latent_world_model import LatentWorldModel
 
 
-def load_world_model(checkpoint_path: Path, device: str | torch.device) -> tuple[LatentWorldModel, Any]:
+def load_world_model(
+    checkpoint_path: Path,
+    device: str | torch.device,
+    codec_checkpoint: str | Path | None = None,
+) -> tuple[LatentWorldModel, Any]:
     """Load the right world-model class from a checkpoint dir.
 
     Dispatches on ``model.architecture._target_`` in the saved ``world_model_config.yaml`` and calls
     that class's ``load_from_checkpoint`` (single-player or 4-player), so the saved config goes
     through the same ``_target_``/removed-field cleaning the dedicated loaders apply. Falls back to
     :class:`LatentWorldModel` for older checkpoints without a ``_target_``. Returns ``(model, run_config)``.
+
+    ``codec_checkpoint`` overrides the config's ``codec_checkpoint`` -- released checkpoints bake an
+    absolute path from the training machine, so pass the local codec here when it lives elsewhere.
     """
     from omegaconf import OmegaConf  # noqa: PLC0415 -- optional dep, used only on the real path
 
@@ -38,4 +45,8 @@ def load_world_model(checkpoint_path: Path, device: str | torch.device) -> tuple
         else LatentWorldModel
     )
     # Both variants share the LatentWorldModel surface (duck-typed); annotate as such.
-    return cast("LatentWorldModel", model_cls.load_from_checkpoint(checkpoint_path, device=device)), cfg
+    extra = {"codec_checkpoint": codec_checkpoint} if codec_checkpoint is not None else {}
+    return (
+        cast("LatentWorldModel", model_cls.load_from_checkpoint(checkpoint_path, device=device, **extra)),
+        cfg,
+    )
