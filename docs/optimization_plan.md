@@ -412,15 +412,32 @@ Two follow-ups this surfaced:
   `codec_checkpoint` override, and `qualitycheck_steps` auto-detects the codec that ships alongside the
   checkpoint (`<repo_root>/codec/checkpoint-*/checkpoint.pth`) — no manual path needed.
 
-## Phase 2 — Quality gate (the proof)  *(paid GPU, ~1–2 H100-hr)*
-Run `qualitycheck_steps` on base and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of
-10-step quality).
-- **Expect:** base min-viable ≈ 4–6; **PSD min-viable = 1–2.** That green-lights 2 steps.
+## Phase 2 — Quality gate (the proof)  *(paid GPU)* — ✅ DONE (2026-07-20)
+Ran `qualitycheck_steps` on base (`1 2 4 8 10`) and PSD (`1 2 10`), 62-sample rocket-science test split.
 - **DINOv3 metric weights are Meta-gated and our HF token is NOT authorized** (`stage_dino` → 403
-  GatedRepoError; it now exits gracefully). So the DINO metrics run random-init and are excluded: the
-  Modal `qualitycheck_steps` auto-passes `--exclude-metric-substr dino fdd`, and the min-viable decision
-  falls back to **`latent_drift_20` + `lpips` + `fid_at_*` (Inception, DINO-free)** — a valid quality
-  signal for the base-vs-PSD comparison. (Request access at the DINOv3 HF page to restore DINO metrics.)
+  GatedRepoError; it now exits gracefully). DINO metrics are skipped (the backbone can't be built);
+  the min-viable decision uses **`latent_drift_20` + `lpips` + `fid_at_*` (Inception, DINO-free)**.
+  (Request access at the DINOv3 HF page to restore the DINO metrics.)
+
+**Results (min-viable = fewest steps within 5% of that model's own 10-step; FID is the binding metric —
+the reconstruction metrics improve at fewer steps, the perception–distortion tradeoff):**
+- **BASE min-viable = 8 steps.** Degrades below: 1-step +16%, 2-step +13%, 4-step +9% vs base@10. So the
+  base model is stuck near its 10-step default — confirms you can't just lower its steps.
+- **PSD min-viable = 2 steps.** 2-step +3.6% vs PSD@10 (OK); 1-step +6.0% (marginal). PSD holds at 2.
+
+**The serving swap — PSD@2 vs the shipped base@10 (apples-to-apples):**
+
+| metric (lower=better) | base @ 10 (shipped) | PSD @ 2 (proposed) | Δ |
+|---|---|---|---|
+| FID (agg) | 36.8 | 37.2 | +1.1% |
+| fid_at_10 | 46.7 | 45.8 | −1.8% |
+| fid_at_20 | 57.9 | 60.1 | +3.8% |
+| latent_drift_20 | 0.396 | 0.391 | −1.3% |
+| lpips | 0.304 | 0.305 | +0.3% |
+
+**⇒ PSD@2 is quality-equivalent to base@10** (±1–4% on 62 samples = noise; better on some). PSD@10
+(FID 36.3) even edges base@10 — PSD isn't a weaker model, it just holds at low steps. **GREEN LIGHT for
+2-step PSD.** (1-step PSD = ~8.5× is available but ~4–6% worse on FID — opt-in aggressive, not default.)
 
 ## Phase 3 — PSD graph wiring + correctness  *(Tier B code, done in Phase 0; verify here)*
 - `bench_infer_speed --compile --cuda-graphs --psd --verify-graphs` → **maxdiff 0.0** (PSD graphed ==
@@ -441,10 +458,10 @@ Run `qualitycheck_steps` on base and PSD over `1 2 4 8 10` steps; report min-via
 |---|---|---|---|
 | 0 Tier B graphs | ✅ code done | none | — |
 | 1 stage assets | ✅ staged + verified | none | — |
-| 2 quality gate | ⏳ awaits run | ~1–2 hr | DINOv3 metric weights (`stage_dino`); else FID/latent-drift only |
+| 2 quality gate | ✅ GREEN: PSD@2 ≈ base@10 (FID +1.1%) | done | — |
 | 3 PSD graph verify | ✅ BIT-EXACT (maxdiff 0.0) | — | — |
 | 4 speed confirm | ✅ 24.7 ms 2-step / 20.4 ms 1-step (graphs engaged) | — | — |
-| 5 defaults + docs | pending | none | gated on Phase 2 result |
+| 5 defaults + docs | ⏳ in progress | none | — |
 
 **Progress:** Phase 0 (Tier B PSD graphs) + Phase 1 (assets staged + verified on the volume) done.
 Phase 3 (`infer --compile --cuda-graphs --psd --verify-graphs`, bit-exact) and Phase 4 (2-step speed)
