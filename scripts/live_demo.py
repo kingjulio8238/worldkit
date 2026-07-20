@@ -134,7 +134,11 @@ class LiveSession:
         self.actions = self.actions.cat_time(new)
 
     def step(self, keys: list[int]):
-        """Denoise + decode one latent from the held keys; return (uint8 HWC frames, gpu_ms)."""
+        """Denoise one latent from the held keys, decode it, and return (uint8 HWC frame, denoise_ms).
+
+        `denoise_ms` times ONLY the diffusion (streaming_inference_step) -- the thing we optimized
+        (2-step vs 10-step) and the honest Ours-vs-Released number; decode is a shared constant cost.
+        """
         torch = self.torch
         self._append_action(keys)
 
@@ -146,20 +150,26 @@ class LiveSession:
                 self.z, self.actions, streaming_kv_cache=self.kv, config=self.cfg,
                 graph_runner=self.graph_runner, ring_cache=self.cfg.cuda_graphs,
             )
-            video = self.model.decode_to_video(self.z[:, -1:])  # (1, td, C, H, W) in [-1, 1]
             end.record()
-        torch.cuda.synchronize()
-        gpu_ms = start.elapsed_time(end)
+            torch.cuda.synchronize()
+            denoise_ms = start.elapsed_time(end)
+            # Decode a short trailing window: the temporally-downsampled codec needs neighbouring
+            # latents for a valid frame -- decoding a single latent in isolation renders black.
+            dw = min(4, self.z.shape[1])
+            video = self.model.decode_to_video(self.z[:, -dw:])  # (1, dw*td, C, H, W) in [-1, 1]
 
-        # [-1,1] -> uint8 HWC. Keep only the newest video frame for display.
         vid = ((video[0, -1].clamp(-1, 1) * 0.5 + 0.5) * 255).to(torch.uint8)  # (C, H, W)
         frame = vid.permute(1, 2, 0).contiguous().cpu().numpy()                # (H, W, C)
+        if self.frame_idx < 3:  # diagnostic: confirm the decode carries signal (not all-zero/black)
+            print(f"[{self.mode} f{self.frame_idx}] denoise {denoise_ms:.1f}ms  decoded "
+                  f"min/max/mean={video.min():.2f}/{video.max():.2f}/{video.mean():.2f}  "
+                  f"frame={tuple(frame.shape)}", flush=True)
         self.frame_idx += 1
         # Trim the action history so it can't grow unbounded over a long session.
         keep = (self.window + 2) * self.td
         if self.actions.key_presses.shape[1] > keep:
             self.actions = self.actions.slice_time(-keep, None)
-        return frame, gpu_ms
+        return frame, denoise_ms
 
 
 # --------------------------------------------------------------------------- model loading
