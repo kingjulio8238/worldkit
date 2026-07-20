@@ -234,11 +234,12 @@ BASE_SESSION = None  # released baseline (10-step, eager)
 def web():
     import base64
     import io
+    import json
     import traceback
 
     import torch
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse
+    from fastapi.responses import HTMLResponse, JSONResponse
     from PIL import Image
     from starlette.concurrency import run_in_threadpool
 
@@ -266,17 +267,24 @@ def web():
     def index():
         return HTMLResponse(HTML)
 
+    @fapp.get("/ping")
+    def ping():
+        return JSONResponse({"ok": True, "ready": OPT_SESSION is not None})
+
     def _panel(session, keys: list[int]) -> dict:
         frame, ms = session.step(keys)
+        img = Image.fromarray(frame)
+        img.thumbnail((480, 480))  # cap payload size (the JPEG is what gets shipped each frame)
         buf = io.BytesIO()
-        Image.fromarray(frame).save(buf, format="JPEG", quality=80)
+        img.save(buf, format="JPEG", quality=72)
+        ms = max(float(ms), 0.1)   # guard against a 0 that would make fps non-finite (invalid JSON)
         fps = 1000.0 / ms * session.td
         return {
             "frame": base64.b64encode(buf.getvalue()).decode(),
             "ms": round(ms, 1), "fps": round(fps, 1),
-            "rt": round(fps / session.model.config.video.fps, 2),
+            "rt": round(fps / float(session.model.config.video.fps), 2),
             "fpd": int(fps * 3600.0 / H100_USD_PER_HR),
-            "steps": session.cfg.n_diffusion_steps,
+            "steps": int(session.cfg.n_diffusion_steps),
         }
 
     def _process(body: dict) -> dict:
@@ -296,15 +304,22 @@ def web():
             traceback.print_exc()
             return {"event": "error", "detail": f"{type(exc).__name__}: {exc}"}
 
-    # Parse the body manually (robust through Modal's ASGI wrapper -- a Pydantic body-model 422'd) and
-    # offload the GPU work to a threadpool so it never blocks the async event loop.
+    # Read the raw body ourselves (a Pydantic body-model 422'd through Modal's ASGI wrapper), offload
+    # the GPU work to a threadpool, and return an EXPLICIT JSONResponse (dumping with allow_nan=False so
+    # a stray inf/nan surfaces as a clean error instead of a malformed body Modal rejects with 422).
     @fapp.post("/step")
     async def step(request: Request):
         try:
-            body = await request.json()
+            raw = await request.body()
+            body = json.loads(raw) if raw else {}
         except Exception:  # noqa: BLE001
             body = {}
-        return await run_in_threadpool(_process, body)
+        result = await run_in_threadpool(_process, body)
+        try:
+            payload = json.dumps(result, allow_nan=False)
+        except (ValueError, TypeError) as exc:
+            payload = json.dumps({"event": "error", "detail": f"serialize: {exc}"})
+        return JSONResponse(content=json.loads(payload))
 
     return fapp
 
