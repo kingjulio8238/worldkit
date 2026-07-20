@@ -232,6 +232,19 @@ def qualitycheck(checkpoint: str, optims: str = "baseline,A1,A2,A4,A5", num_samp
     _run(cmd)
 
 
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=10800)
+def qualitycheck_steps(checkpoint: str, n_diffusion_steps: str = "1 2 4 8 10", num_samples: int = 256,
+                       schedule_type: str = "linear_quadratic", compile: bool = False, data_index: str = "") -> None:
+    """E2 quality-vs-steps: FDD/drift at each diffusion-step count on a REAL checkpoint (on the volume)."""
+    cmd = ["qualitycheck_steps.py", checkpoint, "--n-diffusion-steps", *n_diffusion_steps.split(),
+           "--num-samples", str(num_samples), "--schedule-type", schedule_type]
+    if compile:
+        cmd.append("--compile")
+    if data_index:
+        cmd += ["--data-index", data_index]
+    _run(cmd)
+
+
 @app.function(gpu="H100", volumes={"/data": data_vol}, timeout=7200)
 def dataloader_test(data_index: str, batch: int = 1, num_workers: int = 6, steps: int = 30) -> None:
     """Cached-batch vs real-loader throughput (needs a clip index uploaded to the volume)."""

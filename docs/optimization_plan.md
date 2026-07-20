@@ -175,9 +175,40 @@ launch-bound→compute-bound crossover.
 These are the only untouched plan items; they are **algorithmic / serving-architecture**, not
 kernel-level flags, so they are characterized here rather than measured by a bench run:
 - **E2. Fewer diffusion steps / step-distillation** — the single biggest wall-clock lever (latency is
-  ~linear in steps: 1-step 21.6 ms vs 4-step 36.5 ms). But going below the trained step count requires
-  *training* a distilled few-step (or 1-step) student — out of scope for the inference harness; needs a
-  training run + FDD gate. **Highest-upside future work.**
+  ~linear in steps: with graphs 1-step 20.3 ms vs 4-step 33.4 ms ⇒ ~1.6×). The speed is already
+  measured; the open question is **quality**. Harness: `qualitycheck_steps.py` (+ Modal
+  `qualitycheck_steps`) runs the FDD/DINO-drift metrics at each step count on a real checkpoint and
+  reports the **min viable steps** (fewest within 5% of the max-step quality). **Now runnable** — the
+  weights are public (below); no training needed to *characterize* it, only to push further.
+
+  **Available checkpoints (public, ungated, HF, as of 2026-07-20 — the "unlock at launch" gate is stale):**
+  Alakazam's MIRA-Mini reproductions (the 5B MIRA itself ships code+dataset only, no weights):
+  - `alakazamworld/mira-mini` — 1B single-player (`checkpoint-52000`, ~20 GB) — the base for the sweep.
+  - `alakazamworld/mira-mini-psd` — **1B, already a 2-step progressive-self-distillation variant** — the
+    distillation E2 would produce, ready to compare against the base at low steps.
+  - `alakazamworld/mira-mini-4p` (multiplayer), `alakazamworld/mira-mini-364m` (distilled student).
+  Layout matches our loader exactly (`world_model_config.yaml` + `checkpoint-*/checkpoint.pth` + `codec/`
+  + `context/`). **Dataset `kyutai/rocket-science` is gated** (HF login + accept CC-BY-NC-SA terms); the
+  `test/` split has the `index.json` the eval needs. CC BY-NC-SA 4.0, non-commercial.
+
+  **The MIRA paper (arXiv 2607.05352, §6.4 / Fig 11) already answers the core E2 question:** it sweeps
+  flow-matching steps {1,2,4,6,8,10} for the baseline vs a **PSD self-distilled** model. Inference
+  default = **10 steps** (linear-quadratic schedule, context re-noise 0.2). Finding: the **undistilled
+  baseline degrades sharply below ~4-6 steps; the PSD-distilled model stays stable down to 1-2 steps**
+  (PSD wins at every step count, by a wide margin in the few-step regime). Baseline latent-WM quality:
+  gFDD 0.55 / gFID 10.7 / gFVD 163.1.
+
+  **⇒ E2 conclusion (research-backed):** you can't just lower `n_diffusion_steps` on the base model —
+  quality collapses. The win is the **distilled model at few steps**, and it already exists as
+  `mira-mini-psd` (2-step). So the E2 lever = **run the 2-step PSD model instead of the 10-step base**
+  ≈ **~5× fewer denoise forwards at maintained quality** — and our compile+A3+E1 stack applies on top of
+  it (2-step + graphs = 24.7 ms/frame in our bench). Our `qualitycheck_steps` sweep VERIFIES this on the
+  real checkpoints (base degrades, psd holds).
+
+  **Gotcha:** the FDD metric needs Meta-gated **DINOv3** weights (`torch.hub` + `RS_DINO_WEIGHTS_DIR`),
+  separate from the codec's DINO. So a full FDD run needs: mira-mini weights (public), the rocket-science
+  test split (HF-gated), and DINOv3 weights (Meta-gated). The step-count SPEED is already measured and
+  weight-agnostic; only the quality curve needs these.
 - **E3. Overlap decode with next-frame denoise** — pipeline the frozen-codec decode (already 27–43×
   realtime, non-bottleneck) against the next frame's denoise to hide it in end-to-end serving. A serving
   -loop change, not a kernel change; only matters for the decode-inclusive path.
