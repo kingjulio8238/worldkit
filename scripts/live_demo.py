@@ -36,8 +36,11 @@ H100_USD_PER_HR = 3.95
 def _prefetch_dino() -> None:
     import torch
 
+    # trust_repo + skip_validation avoid torch.hub's GitHub *API* fork-validation call, which is
+    # unauthenticated (60 req/hr) and 403s on rebuilds ("rate limit exceeded"). The zipball still
+    # downloads (different endpoint); once cached, runtime is a cache hit with no network/validation.
     torch.hub.load("facebookresearch/dinov3", "dinov3_vitl16", source="github",
-                   verbose=False, pretrained=False)
+                   verbose=False, pretrained=False, trust_repo=True, skip_validation=True)
 
 
 image = (

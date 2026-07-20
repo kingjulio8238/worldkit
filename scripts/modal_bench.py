@@ -32,12 +32,16 @@ def _prefetch_dino() -> None:
     """Cache the DINOv3 hub repo + architecture at image-build time (no gated weights)."""
     import torch
 
+    # trust_repo + skip_validation avoid torch.hub's unauthenticated GitHub API fork-validation call
+    # (60 req/hr -> 403 "rate limit exceeded" on rebuilds); the zipball still downloads and caches.
     torch.hub.load(
         repo_or_dir="facebookresearch/dinov3",
         model="dinov3_vitl16",
         source="github",
         verbose=False,
         pretrained=False,
+        trust_repo=True,
+        skip_validation=True,
     )
 
 
