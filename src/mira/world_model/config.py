@@ -123,5 +123,10 @@ class WorldModelInferenceConfig(BaseModel):
     streaming_cache: Literal["grow", "ring"] = "grow"
     # E1: capture the whole per-frame denoise (all diffusion steps + kv-update + ring rotation) into a
     # CUDA graph and replay it, eliminating per-kernel launch overhead. Requires a fixed cache
-    # (forces "ring"), single-player, n_register_tokens==0, PSD off. Default off. See E1 in the plan.
-    cuda_graphs: bool = False
+    # (forces "ring"); single-player, n_register_tokens==0 (PSD is supported, Tier B). Bit-exact
+    # (verified maxdiff 0.0) and read only by the streaming `rollout()`, which AUTO-FALLS-BACK to eager
+    # on any unsupported/failed capture (CPU, register tokens, etc.) -- so on-by-default is safe. The one
+    # assumption is a single in-process rollout at a time (the static buffers are shared); concurrent
+    # rollouts in one process must pass cuda_graphs=False. Default on: it's a free bit-exact speedup for
+    # the interactive single-stream serving path (e.g. -8.5% at 4-step, and the 24.7ms 2-step PSD path).
+    cuda_graphs: bool = True

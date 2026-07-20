@@ -24,6 +24,10 @@ configs/
 - **`eval_world_model.yaml`** is the offline-evaluation entry point. It carries only the
   `world_model_metrics` block; the checkpoint supplies its own model and dataset config, so this
   file just configures how the eval is run (set `checkpoint` and `output_dir` at eval time).
+- **`serve_psd_2step.yaml`** is the validated fast-serving preset: the 2-step `mira-mini-psd`
+  checkpoint + the full inference stack (compile + precomputed RoPE + CUDA graphs) → ~24.7 ms/
+  latent-frame, ~7× the released 10-step base at matched quality. Its `inference` block maps 1:1 onto
+  `WorldModelInferenceConfig` (see the file header for the load snippet and `docs/optimization_plan.md`).
 
 ## `model/`
 

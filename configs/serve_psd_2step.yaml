@@ -1,0 +1,30 @@
+# Validated serving preset: 2-step PSD, the fast interactive world-model config.
+#
+# Result (docs/optimization_plan.md, E2): the released 10-step base runs eager at ~173 ms/latent-frame;
+# this 2-step PSD config with the full optimization stack (torch.compile + A3 precomputed RoPE + E1
+# CUDA graphs) runs at ~24.7 ms/latent-frame (~40 fps, ~4x realtime) -- ~7.0x faster -- at MATCHED
+# quality (PSD@2 Inception-FID 37.2 vs base@10 36.8, +1.1%; 62-sample rocket-science test split).
+#
+# `inference` maps 1:1 onto mira.world_model.config.WorldModelInferenceConfig. Load it with OmegaConf
+# and validate into the config, e.g.:
+#
+#     from omegaconf import OmegaConf
+#     from mira.world_model.config import WorldModelInferenceConfig
+#     raw = OmegaConf.load("configs/serve_psd_2step.yaml")
+#     cfg = WorldModelInferenceConfig(**raw.inference)
+#     # ... load the PSD checkpoint (see `checkpoint`) and roll out with `cfg`.
+#
+# Run the model with `compile` on (compile the world_model + decode_to_video) for the full stack; the
+# ~7x figure includes it. cuda_graphs is already the library default (opt-out with cuda_graphs: false
+# for concurrent in-process rollouts). 1-step (n_diffusion_steps: 1) is ~8.5x but ~4-6% worse FID --
+# an aggressive opt-in, not this default.
+
+# The 2-step progressive-self-distillation checkpoint (public, ungated).
+checkpoint: alakazamworld/mira-mini-psd
+
+inference:
+  n_diffusion_steps: 2          # PSD holds quality here; the base would need ~8-10 (see E2 gate)
+  schedule_type: linear_quadratic
+  noise_level: 0.2
+  streaming_cache: ring         # fixed preallocated KV buffer (forced anyway when cuda_graphs is on)
+  cuda_graphs: true             # whole-frame CUDA-graph replay; bit-exact, auto-falls-back if unsupported

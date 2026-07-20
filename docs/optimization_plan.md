@@ -448,10 +448,16 @@ the reconstruction metrics improve at fewer steps, the perception–distortion t
 - `modal run ...::infer --n-diffusion-steps "1 2" --compile --cuda-graphs` (+ `--psd`) →
   2-step ≈ **24 ms/frame, ~4.1× realtime** — closes the ~7× claim on the PSD path.
 
-## Phase 5 — Make it the serving default  *(code + docs)*
-- Serving config: PSD checkpoint, `n_diffusion_steps=2`, `schedule_type=linear_quadratic`,
-  `noise_level=0.2`, `cuda_graphs=true`, compile on.
-- Document the 10-step-eager-base → 2-step-PSD-full-stack = ~7× result; commit + push to worldkit.
+## Phase 5 — Make it the serving default  *(code + docs)* — ✅ DONE (2026-07-20)
+- **`cuda_graphs` default flipped `False → True`** (`WorldModelInferenceConfig`). It's read only by the
+  streaming `rollout()`, is bit-exact, and auto-falls-back to eager on any unsupported/failed capture
+  (CPU, register tokens, multiplayer), so on-by-default is safe. Caveat documented: one in-process
+  rollout at a time (shared static buffers) — concurrent callers pass `cuda_graphs=False`.
+- **Serving preset `configs/serve_psd_2step.yaml`**: PSD checkpoint + `n_diffusion_steps=2`,
+  `linear_quadratic`, `noise 0.2`, ring cache, cuda_graphs — maps 1:1 onto `WorldModelInferenceConfig`
+  (load snippet in the file header). Referenced from `configs/README.md`.
+- **Net:** released 10-step base eager ~173 ms/frame → 2-step PSD full stack **24.7 ms/frame ≈ 7.0×**,
+  matched quality. 1-step (`n_diffusion_steps: 1`) = ~8.5× is an opt-in aggressive mode (~4–6% FID).
 
 ## Status / critical path
 | phase | status | GPU $ | blocker |
@@ -461,8 +467,9 @@ the reconstruction metrics improve at fewer steps, the perception–distortion t
 | 2 quality gate | ✅ GREEN: PSD@2 ≈ base@10 (FID +1.1%) | done | — |
 | 3 PSD graph verify | ✅ BIT-EXACT (maxdiff 0.0) | — | — |
 | 4 speed confirm | ✅ 24.7 ms 2-step / 20.4 ms 1-step (graphs engaged) | — | — |
-| 5 defaults + docs | ⏳ in progress | none | — |
+| 5 defaults + docs | ✅ cuda_graphs default on + serve_psd_2step.yaml | none | — |
 
-**Progress:** Phase 0 (Tier B PSD graphs) + Phase 1 (assets staged + verified on the volume) done.
-Phase 3 (`infer --compile --cuda-graphs --psd --verify-graphs`, bit-exact) and Phase 4 (2-step speed)
-are runnable now with no further deps; Phase 2 additionally wants `stage_dino` for valid DINO metrics.
+**Progress: E2 COMPLETE.** All phases done. Tier B PSD graphs (0) + assets staged (1) + quality gate
+GREEN (2: PSD@2 ≈ base@10) + PSD graph bit-exact (3) + 24.7 ms 2-step measured (4) + serving default
+flipped & preset shipped (5). **Net inference result: ~7.0× vs the released 10-step base, matched
+quality**, via 2-step PSD + compile + A3 + CUDA graphs. Adopt with `configs/serve_psd_2step.yaml`.
