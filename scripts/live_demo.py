@@ -226,10 +226,10 @@ def web():
     import traceback
 
     import torch
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.responses import HTMLResponse
     from PIL import Image
-    from pydantic import BaseModel
+    from starlette.concurrency import run_in_threadpool
 
     device = torch.device("cuda")
     print("Loading models (this warms both checkpoints)...", flush=True)
@@ -250,31 +250,26 @@ def web():
 
     fapp = FastAPI()
 
-    class StepReq(BaseModel):
-        keys: list[int] = []
-        cmd: str | None = None
-        mode: str | None = None
-
     @fapp.get("/")
     def index():
         return HTMLResponse(HTML)
 
-    # Sync endpoint -> FastAPI runs it in a threadpool, so the GPU step never blocks the event loop.
-    @fapp.post("/step")
-    def step(req: StepReq):
+    def _process(body: dict) -> dict:
+        """All the (blocking) GPU work; run in a threadpool so the event loop stays free."""
         try:
-            if req.cmd == "mode":
-                SESSION.set_mode(req.mode or "optimized")
+            cmd = body.get("cmd")
+            if cmd == "mode":
+                SESSION.set_mode(body.get("mode") or "optimized")
                 SESSION.step([])  # recapture graph for the newly selected mode
                 return {"event": "mode", "mode": SESSION.mode}
-            if req.cmd == "reset":
+            if cmd == "reset":
                 SESSION.reset()
                 return {"event": "reset"}
-            if req.cmd == "seed":
+            if cmd == "seed":
                 SESSION.next_seed()
                 return {"event": "seed", "idx": SESSION.seed_idx}
 
-            frame, gpu_ms = SESSION.step(req.keys)
+            frame, gpu_ms = SESSION.step(body.get("keys", []))
             img = Image.fromarray(frame)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=80)
@@ -292,6 +287,16 @@ def web():
         except Exception as exc:  # noqa: BLE001 -- surface errors to the client for live debugging
             traceback.print_exc()
             return {"event": "error", "detail": f"{type(exc).__name__}: {exc}"}
+
+    # Parse the body manually (robust through Modal's ASGI wrapper -- a Pydantic body-model 422'd) and
+    # offload the GPU work to a threadpool so it never blocks the async event loop.
+    @fapp.post("/step")
+    async def step(request: Request):
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        return await run_in_threadpool(_process, body)
 
     return fapp
 
