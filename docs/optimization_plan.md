@@ -373,13 +373,14 @@ quality down to **1–2 steps**. Stacking the two independent multipliers:
 | lever | needs | factor |
 |---|---|---|
 | step distillation 10 → 2 | `alakazamworld/mira-mini-psd` (public) | ~3.1× (173 → 55.6 ms eager) |
-| our engineering stack (compile + A3 + E1 graphs) | shipped | ~2.3× (55.6 → 24.1 ms) |
-| **combined** | both | **~7.2×** (173 ms 10-step-eager base → **24.1 ms** 2-step full-stack) |
+| our engineering stack (compile + A3 + E1 graphs) | shipped | ~2.3× (55.6 → 24.7 ms) |
+| **combined** | both | **~7.0×** (173 ms 10-step-eager base → **24.7 ms** 2-step full-stack) |
 
 Baseline = released MIRA-**Mini** (1B, 10 steps, eager, compile off) ≈ 173 ms/frame (extrapolated from
-the measured 1/2/4/8-step curve). Target = 2-step PSD + full stack = **24.1 ms/frame (~41 fps, 4.1×
-realtime)**. All on **MIRA-Mini 1B**, not the 5B MIRA (unreleased). The *speed* is already measured
-(weight-agnostic); the gate is *quality* — proving 2-step PSD holds.
+the measured 1/2/4/8-step curve). Target = 2-step PSD + full stack = **24.7 ms/frame (~40 fps, 4.04×
+realtime)** — MEASURED on the PSD inference path (Phase 4, graphs engaged); 1-step = 20.4 ms (4.9×). All
+on **MIRA-Mini 1B**, not the 5B MIRA (unreleased). The *speed* is now confirmed; the remaining gate is
+*quality* — proving 2-step PSD holds (Phase 2).
 
 ## Phase 0 — Graph tier decision → **Tier B (chosen)**
 Because a PSD checkpoint feeds an extra per-step input (`tau_delta`, the integration step size,
@@ -431,8 +432,8 @@ and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of 10-step q
 | 0 Tier B graphs | ✅ code done | none | — |
 | 1 stage assets | ✅ staged + verified | none | — |
 | 2 quality gate | ⏳ awaits run | ~1–2 hr | DINOv3 metric weights (`stage_dino`); else FID/latent-drift only |
-| 3 PSD graph verify | ⏳ awaits run | minutes | none (random-init, no deps) |
-| 4 speed confirm | ⏳ awaits run | minutes | none (speed already measured) |
+| 3 PSD graph verify | ✅ BIT-EXACT (maxdiff 0.0) | — | — |
+| 4 speed confirm | ✅ 24.7 ms 2-step / 20.4 ms 1-step (graphs engaged) | — | — |
 | 5 defaults + docs | pending | none | gated on Phase 2 result |
 
 **Progress:** Phase 0 (Tier B PSD graphs) + Phase 1 (assets staged + verified on the volume) done.
