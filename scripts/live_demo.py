@@ -12,9 +12,11 @@ per frame) — robust on Modal's runtime; the per-frame GPU time is what the HUD
 
 Controls: W/A/S/D drive, Q/E air-roll, Space ball-cam, Shift boost/powerslide, Ctrl. Buttons toggle
 Ours vs Released and reset the world. See docs/optimization_plan.md (E2) for the ~7x result.
-"""
 
-from __future__ import annotations
+NOTE: do NOT add `from __future__ import annotations` here. It stringifies annotations (PEP 563), and
+FastAPI then resolves `request: Request` against the *module* globals -- but Request is imported inside
+web(), so it can't resolve it and 422s the param as a missing query field.
+"""
 
 from pathlib import Path
 
