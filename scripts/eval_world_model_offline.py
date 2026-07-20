@@ -74,10 +74,11 @@ def load_eval_metrics_config(
     num_samples: int | None = None,
     no_compile: bool = False,
     inference: WorldModelInferenceConfig | None = None,
+    compute_dino_metrics: bool | None = None,
 ) -> WorldModelMetricsConfig:
     """Build the eval :class:`WorldModelMetricsConfig` from ``configs/eval_world_model.yaml``.
 
-    CLI overrides (sample count, compile, inference knobs) are applied on top.
+    CLI overrides (sample count, compile, inference knobs, DINO on/off) are applied on top.
     """
     from hydra.utils import instantiate  # noqa: PLC0415
     from omegaconf import OmegaConf  # noqa: PLC0415
@@ -90,6 +91,8 @@ def load_eval_metrics_config(
         config.compile = False
     if inference is not None:
         config.inference = inference
+    if compute_dino_metrics is not None:
+        config.compute_dino_metrics = compute_dino_metrics
     return config
 
 

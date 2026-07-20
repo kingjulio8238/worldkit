@@ -69,6 +69,11 @@ class WorldModelMetricsConfig(BaseModel):
     compile: bool = True  # whether to compile the DINO backbone for faster inference
     # Max frames per DINO forward pass, reduces peak memory (None = no limit).
     dino_max_chunk_size: int | None = None
+    # Whether to build the DINOv3 backbone and compute the DINO-based metrics (dino drift + FDD). Set
+    # False when DINOv3 weights are unavailable (Meta-gated): the backbone can't be constructed without
+    # them, so the metric would crash. With it off, latent_drift + Inception-FID + LPIPS/PSNR/SSIM still
+    # run and give a valid quality signal.
+    compute_dino_metrics: bool = True
     # How many eval samples to visualize (logged to W&B from the metrics loop).
     num_viz_samples: int = 8
     # Inference settings (e.g. n_diffusion_steps, noise_level) used when unrolling the world model.
@@ -76,24 +81,27 @@ class WorldModelMetricsConfig(BaseModel):
 
 
 class _MetricTrackers(BaseModel):
-    dino_cos_drift: DistributedMetric
-    dino_l2_drift: DistributedMetric
     latent_drift: DistributedMetric
-    dino_frechet: SlicedFrechetMetric
     inception_frechet: SlicedFrechetMetric
-    # FDD decomposition: vs_recon = prediction vs codec reconstruction (world-model error);
-    # codec_floor = codec reconstruction vs original frames (codec error).
-    dino_frechet_vs_recon: SlicedFrechetMetric
-    dino_frechet_codec_floor: SlicedFrechetMetric
     psnr: PSNRMetric
     lpips: DistributedLPIPS
     ssim: DistributedSSIM
+    # DINO-based trackers are None when compute_dino_metrics is off (weights unavailable).
+    dino_cos_drift: DistributedMetric | None = None
+    dino_l2_drift: DistributedMetric | None = None
+    dino_frechet: SlicedFrechetMetric | None = None
+    # FDD decomposition: vs_recon = prediction vs codec reconstruction (world-model error);
+    # codec_floor = codec reconstruction vs original frames (codec error).
+    dino_frechet_vs_recon: SlicedFrechetMetric | None = None
+    dino_frechet_codec_floor: SlicedFrechetMetric | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def reset(self) -> None:
         for field_name in self.__class__.model_fields:
-            getattr(self, field_name).reset()
+            tracker = getattr(self, field_name)
+            if tracker is not None:
+                tracker.reset()
 
 
 class WorldModelMetrics:
@@ -126,24 +134,32 @@ class WorldModelMetrics:
             f"fdd_slice_frames ({config.fdd_slice_frames})"
         )
         self.num_slices = config.num_unrolled_frames // config.fdd_slice_frames
-        self.dino = DinoForMetrics(model_size="base").to(device)
+        # DINO backbone needs (Meta-gated) weights; skip it entirely when disabled so the eval still
+        # runs on latent_drift + Inception-FID + LPIPS/PSNR/SSIM.
+        self.compute_dino = config.compute_dino_metrics
+        self.dino = DinoForMetrics(model_size="base").to(device) if self.compute_dino else None
         inception_block_idx = InceptionV3ForFID.BLOCK_INDEX_BY_DIM[INCEPTION_FID_DIM]
         self._inception = InceptionV3ForFID([inception_block_idx]).to(device).eval()
         self._inception.requires_grad_(False)
-        self._trackers = _MetricTrackers(
-            dino_cos_drift=DistributedMetric(device=device),
-            dino_l2_drift=DistributedMetric(device=device),
+        tracker_kwargs = dict(
             latent_drift=DistributedMetric(device=device),
-            dino_frechet=SlicedFrechetMetric(self.dino.dino_dim, self.num_slices).to(device),
             inception_frechet=SlicedFrechetMetric(INCEPTION_FID_DIM, self.num_slices).to(device),
-            dino_frechet_vs_recon=SlicedFrechetMetric(self.dino.dino_dim, self.num_slices).to(device),
-            dino_frechet_codec_floor=SlicedFrechetMetric(self.dino.dino_dim, self.num_slices).to(device),
             psnr=PSNRMetric(device=device),
             lpips=DistributedLPIPS(device=device),
             ssim=DistributedSSIM(device=device),
         )
+        if self.compute_dino:
+            dd = self.dino.dino_dim
+            tracker_kwargs.update(
+                dino_cos_drift=DistributedMetric(device=device),
+                dino_l2_drift=DistributedMetric(device=device),
+                dino_frechet=SlicedFrechetMetric(dd, self.num_slices).to(device),
+                dino_frechet_vs_recon=SlicedFrechetMetric(dd, self.num_slices).to(device),
+                dino_frechet_codec_floor=SlicedFrechetMetric(dd, self.num_slices).to(device),
+            )
+        self._trackers = _MetricTrackers(**tracker_kwargs)
 
-        if self.config.compile:
+        if self.config.compile and self.dino is not None:
             self.dino.dino_forward = torch.compile(self.dino.dino_forward)
 
     def process_batch(self, model: LatentWorldModel) -> tuple[InferenceOutputs, list]:
@@ -194,25 +210,29 @@ class WorldModelMetrics:
             pred_inception, real_inception = both_inception.chunk(2, dim=0)
             self._trackers.inception_frechet.update(s, real_inception, pred_inception)
 
-        all_dino_features = self.dino.dino_forward(
-            torch.cat([video[:, n:], batch_video_eval[:, n:]], dim=0),
-            max_chunk_size=self.config.dino_max_chunk_size,
-        )
-        pred_dino_features = all_dino_features[:batch_size]
-        dino_target_features = all_dino_features[batch_size:]
+        if self.compute_dino:
+            all_dino_features = self.dino.dino_forward(
+                torch.cat([video[:, n:], batch_video_eval[:, n:]], dim=0),
+                max_chunk_size=self.config.dino_max_chunk_size,
+            )
+            pred_dino_features = all_dino_features[:batch_size]
+            dino_target_features = all_dino_features[batch_size:]
 
-        dino_similarities = torch.nn.functional.cosine_similarity(
-            pred_dino_features, dino_target_features, dim=-1
-        )
-        # Convert cosine similarity to a distance; in practice a value > 1 means worse than chance.
-        dino_cos_drifts = 1 - dino_similarities
-        dino_cos_drift = dino_cos_drifts.mean(dim=(2, 3)).cpu()[:, : self.config.drift_metric_frames]
+            dino_similarities = torch.nn.functional.cosine_similarity(
+                pred_dino_features, dino_target_features, dim=-1
+            )
+            # Convert cosine similarity to a distance; in practice a value > 1 means worse than chance.
+            dino_cos_drifts = 1 - dino_similarities
+            dino_cos_drift = dino_cos_drifts.mean(dim=(2, 3)).cpu()[:, : self.config.drift_metric_frames]
 
-        # DINO L2 distance (MSE over feature dim, averaged over spatial/temporal).
-        dino_l2_drifts = torch.nn.functional.mse_loss(
-            pred_dino_features, dino_target_features, reduction="none"
-        ).mean(dim=-1)
-        dino_l2_drift = dino_l2_drifts.mean(dim=(2, 3)).cpu()[:, : self.config.drift_metric_frames]
+            # DINO L2 distance (MSE over feature dim, averaged over spatial/temporal).
+            dino_l2_drifts = torch.nn.functional.mse_loss(
+                pred_dino_features, dino_target_features, reduction="none"
+            ).mean(dim=-1)
+            dino_l2_drift = dino_l2_drifts.mean(dim=(2, 3)).cpu()[:, : self.config.drift_metric_frames]
+
+            self._trackers.dino_cos_drift.update(dino_cos_drift)
+            self._trackers.dino_l2_drift.update(dino_l2_drift)
 
         latent_similarities = torch.nn.functional.cosine_similarity(
             z_mean_target.float(),
@@ -223,36 +243,35 @@ class WorldModelMetrics:
         # z_t is in LATENT frames; index by n_context_latents, not n_context_frames.
         latent_drifts = latent_drifts[:, model.n_context_latents :][:, : self.config.drift_metric_frames]
         latent_drift = latent_drifts.mean(dim=(2, 3)).cpu()
-
-        self._trackers.dino_cos_drift.update(dino_cos_drift)
-        self._trackers.dino_l2_drift.update(dino_l2_drift)
         self._trackers.latent_drift.update(latent_drift)
-        for s in range(self.num_slices):
-            fs = slice(s * w, (s + 1) * w)
-            self._trackers.dino_frechet.update(
-                s,
-                dino_target_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1),
-                pred_dino_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1),
-            )
 
-        # FDD decomposition: also compare against the codec's own reconstruction of the GT.
-        # z_for_target is the raw codec latent, so decode it directly (rather than via
-        # decode_to_video, which would also unnormalize). Same [-1, 1] -> [0, 1] post-processing.
-        with torch.no_grad(), _autocast(device):
-            recon_video = (model.codec.decode(z_for_target) * 0.5 + 0.5).float()
-        recon_dino_features = self.dino.dino_forward(
-            recon_video[:, model.config.n_context_frames :],
-            max_chunk_size=self.config.dino_max_chunk_size,
-        )
-        for s in range(self.num_slices):
-            fs = slice(s * w, (s + 1) * w)
-            recon_feats = recon_dino_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1)
-            pred_feats = pred_dino_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1)
-            target_feats = dino_target_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1)
-            # World-model error alone: prediction vs codec reconstruction.
-            self._trackers.dino_frechet_vs_recon.update(s, recon_feats, pred_feats)
-            # Codec error alone: codec reconstruction vs original frames.
-            self._trackers.dino_frechet_codec_floor.update(s, target_feats, recon_feats)
+        if self.compute_dino:
+            for s in range(self.num_slices):
+                fs = slice(s * w, (s + 1) * w)
+                self._trackers.dino_frechet.update(
+                    s,
+                    dino_target_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1),
+                    pred_dino_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1),
+                )
+
+            # FDD decomposition: also compare against the codec's own reconstruction of the GT.
+            # z_for_target is the raw codec latent, so decode it directly (rather than via
+            # decode_to_video, which would also unnormalize). Same [-1, 1] -> [0, 1] post-processing.
+            with torch.no_grad(), _autocast(device):
+                recon_video = (model.codec.decode(z_for_target) * 0.5 + 0.5).float()
+            recon_dino_features = self.dino.dino_forward(
+                recon_video[:, model.config.n_context_frames :],
+                max_chunk_size=self.config.dino_max_chunk_size,
+            )
+            for s in range(self.num_slices):
+                fs = slice(s * w, (s + 1) * w)
+                recon_feats = recon_dino_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1)
+                pred_feats = pred_dino_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1)
+                target_feats = dino_target_features[:, fs].mean(dim=(-1, -2)).flatten(0, 1)
+                # World-model error alone: prediction vs codec reconstruction.
+                self._trackers.dino_frechet_vs_recon.update(s, recon_feats, pred_feats)
+                # Codec error alone: codec reconstruction vs original frames.
+                self._trackers.dino_frechet_codec_floor.update(s, target_feats, recon_feats)
 
         return world_model_outputs, metadata
 
@@ -263,8 +282,6 @@ class WorldModelMetrics:
         """
         df = self.config.drift_metric_frames
         scalar_result: dict[str, torch.Tensor | float] = {
-            f"dino_cos_drift_{df}": self._trackers.dino_cos_drift.compute(),
-            f"dino_l2_drift_{df}": self._trackers.dino_l2_drift.compute(),
             f"latent_drift_{df}": self._trackers.latent_drift.compute(),
             "psnr": self._trackers.psnr.compute_and_reset(),
             "lpips": self._trackers.lpips.compute_and_reset(),
@@ -273,18 +290,23 @@ class WorldModelMetrics:
 
         # Each Frechet metric yields an aggregate scalar (pooled over all unrolled frames) plus a
         # per-slice curve.
-        scalar_result["frechet_dino_distance"], fdd_curve = self._trackers.dino_frechet.compute()
         scalar_result["frechet_inception_distance"], fid_curve = self._trackers.inception_frechet.compute()
-        frechet_curves: dict[str, list[float]] = {"fdd_at": fdd_curve, "fid_at": fid_curve}
+        frechet_curves: dict[str, list[float]] = {"fid_at": fid_curve}
 
-        scalar_result["frechet_dino_distance_vs_recon"], vr_curve = (
-            self._trackers.dino_frechet_vs_recon.compute()
-        )
-        scalar_result["frechet_dino_distance_codec_floor"], cf_curve = (
-            self._trackers.dino_frechet_codec_floor.compute()
-        )
-        frechet_curves["fdd_at_vs_recon"] = vr_curve
-        frechet_curves["fdd_at_codec_floor"] = cf_curve
+        # DINO-based metrics only when the backbone was built (weights available).
+        if self.compute_dino:
+            scalar_result[f"dino_cos_drift_{df}"] = self._trackers.dino_cos_drift.compute()
+            scalar_result[f"dino_l2_drift_{df}"] = self._trackers.dino_l2_drift.compute()
+            scalar_result["frechet_dino_distance"], fdd_curve = self._trackers.dino_frechet.compute()
+            scalar_result["frechet_dino_distance_vs_recon"], vr_curve = (
+                self._trackers.dino_frechet_vs_recon.compute()
+            )
+            scalar_result["frechet_dino_distance_codec_floor"], cf_curve = (
+                self._trackers.dino_frechet_codec_floor.compute()
+            )
+            frechet_curves["fdd_at"] = fdd_curve
+            frechet_curves["fdd_at_vs_recon"] = vr_curve
+            frechet_curves["fdd_at_codec_floor"] = cf_curve
 
         # Also expose each per-slice value as a scalar keyed by the number of frames unrolled at the
         # end of its slice (fdd_at_20 ... fdd_at_120), so the curves are trackable as W&B line plots

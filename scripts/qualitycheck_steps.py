@@ -83,7 +83,21 @@ def main() -> None:
         # The released checkpoint's config points at the training machine's dataset path; override it
         # with the local rocket-science test split (kyutai/rocket-science, gated -- hf login + accept).
         cfg.dataset.test_index = args.data_index
-    wm_cfg = load_eval_metrics_config(num_samples=args.num_samples, no_compile=not args.compile)
+    # The DINOv3 metric backbone needs (Meta-gated) weights; without them it can't even be built. If
+    # they aren't resolvable (RS_DINO_WEIGHTS_DIR), skip the DINO metrics -- latent_drift + Inception-FID
+    # + LPIPS still give a valid base-vs-PSD signal -- and drop the DINO keys from the min-viable set.
+    from mira.codec.dino import resolve_dino_weights
+
+    compute_dino = resolve_dino_weights("dinov3_vitb16") is not None
+    if not compute_dino:
+        print("  DINOv3 metric weights not found (RS_DINO_WEIGHTS_DIR) -> skipping DINO metrics; "
+              "min-viable decided on latent_drift + lpips + fid_at_* (Inception).", flush=True)
+        for s in ("dino", "fdd"):
+            if s not in args.exclude_metric_substr:
+                args.exclude_metric_substr.append(s)
+    wm_cfg = load_eval_metrics_config(
+        num_samples=args.num_samples, no_compile=not args.compile, compute_dino_metrics=compute_dino
+    )
 
     # The config's codec_checkpoint is an absolute path from the training machine; override it with a
     # local codec. Prefer an explicit --codec-checkpoint, else auto-detect the codec that ships in the
