@@ -48,6 +48,11 @@ class SelfAttentionConfig(BaseModel):
     num_kv_heads: int | None
     gating: bool = False
     qk_norm: Literal["layernorm", "rmsnorm"] = "layernorm"
+    # A1: compute QK-norm via the fused F.layer_norm/F.rms_norm kernel (no fp32 round-trip). Default
+    # off preserves the released eager path exactly.
+    qk_norm_fused: bool = False
+    # A2: apply RoPE in the input dtype instead of upcasting q/k to fp32 (set False for bf16 RoPE).
+    rope_upcast: bool = True
 
     @model_validator(mode="after")
     def validate_heads(self):
@@ -106,8 +111,9 @@ class SelfAttention(nn.Module):
         self.wo = nn.Linear(self.dim, self.dim, bias=False)
 
         qk_norm_cls = QKRMSNorm if config.qk_norm == "rmsnorm" else QKLayerNorm
-        self.q_ln = qk_norm_cls((self.num_heads, self.head_dim))
-        self.k_ln = qk_norm_cls((self.num_kv_heads, self.head_dim))
+        self.q_ln = qk_norm_cls((self.num_heads, self.head_dim), fused=config.qk_norm_fused)
+        self.k_ln = qk_norm_cls((self.num_kv_heads, self.head_dim), fused=config.qk_norm_fused)
+        self.rope_upcast = config.rope_upcast
 
     def forward(
         self,
@@ -151,10 +157,10 @@ class SelfAttention(nn.Module):
         if rotary_emb is not None:
             if kv_cache is not None:
                 rotary_emb_q = (rotary_emb[0][-1:], rotary_emb[1][-1:])
-                q = apply_rotary_emb(q, rotary_emb_q)
+                q = apply_rotary_emb(q, rotary_emb_q, upcast=self.rope_upcast)
             else:
-                q = apply_rotary_emb(q, rotary_emb)
-            k = apply_rotary_emb(k, rotary_emb)
+                q = apply_rotary_emb(q, rotary_emb, upcast=self.rope_upcast)
+            k = apply_rotary_emb(k, rotary_emb, upcast=self.rope_upcast)
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
         attn_mask = None
@@ -179,7 +185,7 @@ class SelfAttention(nn.Module):
         return y
 
 
-def apply_rotary_emb(x: Tensor, freqs: tuple[Tensor, Tensor]):
+def apply_rotary_emb(x: Tensor, freqs: tuple[Tensor, Tensor], upcast: bool = True):
     x = rearrange(x, "b t n_head c -> b n_head t c")
     # assume the channel dimension c contains c/2 imaginary numbers, each represented by two
     # consecutive values
@@ -188,19 +194,30 @@ def apply_rotary_emb(x: Tensor, freqs: tuple[Tensor, Tensor]):
     # the imaginary numbers above
     x_real, x_imag = x.unflatten(-1, (-1, 2)).unbind(-1)  # both has shape (b, n_head, t, c // 2)
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(-2)  # (b, n_head, t, c)
-    # apply the rotation matrix
-    out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+    # apply the rotation matrix. Default upcasts to fp32 for accuracy; A2 (upcast=False) rotates in
+    # the input dtype, casting the fp32 cos/sin down instead -- removes the bf16<->fp32 round-trip.
+    if upcast:
+        out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+    else:
+        out = x * cos.to(x.dtype) + x_rotated * sin.to(x.dtype)
     out = rearrange(out, "b n_head t c -> b t n_head c")
     return out
 
 
 class QKLayerNorm(nn.Module):
-    def __init__(self, input_shape: tuple, eps: float = 1e-5):
+    def __init__(self, input_shape: tuple, eps: float = 1e-5, fused: bool = False):
         super().__init__()
         self.qk_scale = nn.Parameter(torch.ones(input_shape))
         self.eps = eps
+        self.fused = fused
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.fused:
+            # A1: F.layer_norm upcasts internally (fp32 accum) and returns x.dtype -- no materialized
+            # fp32 tensor. The per-head affine is applied separately since qk_scale is (n_head, d).
+            normed = F.layer_norm(x, (x.shape[-1],), eps=self.eps)
+            return normed * self.qk_scale.to(x.dtype)
+
         input_dtype = x.dtype
         x = x.to(torch.float32)
 
@@ -217,12 +234,18 @@ class QKLayerNorm(nn.Module):
 class QKRMSNorm(nn.Module):
     """Per-head RMSNorm for Q/K. Same parameter shape as QKLayerNorm so checkpoints are interchangeable."""
 
-    def __init__(self, input_shape: tuple, eps: float = 1e-5):
+    def __init__(self, input_shape: tuple, eps: float = 1e-5, fused: bool = False):
         super().__init__()
         self.qk_scale = nn.Parameter(torch.ones(input_shape))
         self.eps = eps
+        self.fused = fused
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.fused:
+            # A1: fused RMSNorm (internal fp32 accum, bf16 I/O); per-head affine applied separately.
+            normed = F.rms_norm(x, (x.shape[-1],), eps=self.eps)
+            return normed * self.qk_scale.to(x.dtype)
+
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)

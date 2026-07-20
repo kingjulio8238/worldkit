@@ -265,6 +265,8 @@ class LatentWorldModel(nn.Module):
         n_diffusion_steps=10,
         noise_level: float | None = 0.2,
         schedule_type: str = "linear_quadratic",
+        ring_cache: bool = False,
+        graph_runner=None,
     ):
         """Denoise the last latent frame, streaming the context through a kv-cache.
 
@@ -281,90 +283,107 @@ class LatentWorldModel(nn.Module):
         Returns:
             ``(z_t, streaming_kv_caches)``.
         """
-        batch_size, n_latents = z_t.shape[:2]
-        n_context_latents = n_latents - 1
+        n_context_latents = z_t.shape[1] - 1
         device = z_t.device
         timesteps = build_inference_schedule(n_diffusion_steps, device, schedule_type)
         delta_ts = timesteps[1:] - timesteps[:-1]
 
-        # Initialise streaming_kv_caches
         if (n_context_latents > 0) and streaming_kv_caches is None:
-            context_clean_past = None
-            if self.config.use_clean_past:
-                assert self.bos is not None
-                context_clean_past = torch.cat([self.bos.repeat(batch_size, 1, 1, 1, 1), z_t[:, :-2]], dim=1)
-            context_tau = torch.ones((batch_size, n_context_latents, 1, 1, 1), device=device, dtype=z_t.dtype)
-            z_t_prefix = z_t[:, :-1]
-
-            _, streaming_kv_caches = self.world_model(
-                z_t_prefix,
-                a[:, :-1],
-                context_tau,
-                return_kv=True,
-                clean_past=context_clean_past,
-            )
+            streaming_kv_caches = self._prefill_cache(z_t, a)
 
         # The past frame is always a clean (un-noised) latent.
         clean_past = z_t[:, -2:-1] if self.config.use_clean_past else None
 
+        # E1: replay the whole-frame CUDA graph if a runner is attached (it writes the denoised frame
+        # back into z_t and returns the ring cache). `run` returns None if graphs are disabled/failed,
+        # in which case we fall through to the eager body. Graphs imply the ring cache.
+        if graph_runner is not None:
+            result = graph_runner.run(z_t[:, -1:], a[:, -1:], clean_past, streaming_kv_caches)
+            if result is not None:
+                return z_t, result
+            ring_cache = True
+
+        streaming_kv_caches = self._denoise_frame_body(
+            z_t[:, -1:], a[:, -1:], clean_past, streaming_kv_caches,
+            timesteps, delta_ts, noise_level, ring_cache,
+        )
+        return z_t, streaming_kv_caches
+
+    def _prefill_cache(self, z_t: Tensor, a: Tensor):
+        """One-time context prefill: run the world model over the context frames and return the
+        per-layer kv-cache. Eager and dynamic (its length is the context, not the single hot frame)."""
+        batch_size = z_t.shape[0]
+        n_context_latents = z_t.shape[1] - 1
+        device = z_t.device
+        context_clean_past = None
+        if self.config.use_clean_past:
+            assert self.bos is not None
+            context_clean_past = torch.cat([self.bos.repeat(batch_size, 1, 1, 1, 1), z_t[:, :-2]], dim=1)
+        context_tau = torch.ones((batch_size, n_context_latents, 1, 1, 1), device=device, dtype=z_t.dtype)
+        _, streaming_kv_caches = self.world_model(
+            z_t[:, :-1], a[:, :-1], context_tau, return_kv=True, clean_past=context_clean_past
+        )
+        return streaming_kv_caches
+
+    def _denoise_frame_body(
+        self, z_cur, a_cur, clean_past, streaming_kv_caches, timesteps, delta_ts, noise_level, ring_cache,
+    ):
+        """The per-frame denoise: run all diffusion steps on the single hot frame ``z_cur`` (in place),
+        the optional kv-update pass, and the cache rotation. This is the unit E1 captures into a CUDA
+        graph, so with ``ring_cache`` every write is in place on fixed buffers. Bit-identical to the
+        previous inline loop for both cache modes.
+        """
+        batch_size = z_cur.shape[0]
+        device = z_cur.device
+        dtype = z_cur.dtype
         last_kv_cache = None
-        for step_idx, (timestep, delta_t) in enumerate(zip(timesteps[:-1], delta_ts)):
-            tau = timestep * torch.ones((batch_size, 1, 1, 1, 1), device=device, dtype=z_t.dtype)
+        n_steps = len(delta_ts)
+        for step_idx in range(n_steps):
+            tau = timesteps[step_idx] * torch.ones((batch_size, 1, 1, 1, 1), device=device, dtype=dtype)
+            delta_t = delta_ts[step_idx]
             # PSD-trained models take the integration-step size as input; None means no delta.
             tau_delta = delta_t * torch.ones_like(tau) if self.config.psd_enabled else None
-            # With noise_level=None, reuse the final step's forward to also produce
-            # the kv cache instead of running a dedicated call after the loop.
-            return_kv = noise_level is None and step_idx == len(delta_ts) - 1
+            # With noise_level=None, reuse the final step's forward to also produce the kv cache.
+            return_kv = noise_level is None and step_idx == n_steps - 1
 
             pred_v = self.world_model(
-                z_t[:, -1:],
-                a[:, -1:],
-                tau,
-                tau_delta=tau_delta,
-                kv_caches=streaming_kv_caches,
-                return_kv=return_kv,
-                clean_past=clean_past,
+                z_cur, a_cur, tau, tau_delta=tau_delta,
+                kv_caches=streaming_kv_caches, return_kv=return_kv, clean_past=clean_past,
             )
             if return_kv:
                 pred_v, last_kv_cache = pred_v
 
-            z_t[:, -1:] += delta_t * pred_v
+            z_cur += delta_t * pred_v
 
         if noise_level is not None:
-            # update streaming kv cache
-            # add noise on last frame
-            current_tau = (1 - noise_level) * torch.ones(
-                (batch_size, 1, 1, 1, 1), device=device, dtype=z_t.dtype
-            )
-            current_z_t = current_tau * z_t[:, -1:] + (1 - current_tau) * torch.randn_like(z_t[:, -1:])
-            current_z_t = current_z_t.to(dtype=z_t.dtype)
+            current_tau = (1 - noise_level) * torch.ones((batch_size, 1, 1, 1, 1), device=device, dtype=dtype)
+            current_z_t = current_tau * z_cur + (1 - current_tau) * torch.randn_like(z_cur)
+            current_z_t = current_z_t.to(dtype=dtype)
             _, last_kv_cache = self.world_model(
-                current_z_t,
-                a[:, -1:],
-                current_tau,
-                kv_caches=streaming_kv_caches,
-                return_kv=True,
-                clean_past=clean_past,
+                current_z_t, a_cur, current_tau,
+                kv_caches=streaming_kv_caches, return_kv=True, clean_past=clean_past,
             )
 
         assert streaming_kv_caches is not None and last_kv_cache is not None
-        n_register_tokens = self.config.n_register_tokens
+        nreg = self.config.n_register_tokens
         for i in range(len(streaming_kv_caches)):
-            if streaming_kv_caches[i] is not None:
-                k_ctx, v_ctx = streaming_kv_caches[i]
-                new_k, new_v = last_kv_cache[i]
+            if streaming_kv_caches[i] is None:
+                continue
+            k_ctx, v_ctx = streaming_kv_caches[i]
+            new_k, new_v = last_kv_cache[i]
+            if ring_cache:
+                # B1: roll the context region left (drop oldest, keep register tokens), write the new
+                # frame at the end -- all in place on the fixed buffer (the CUDA-graph enabler).
+                for buf, new in ((k_ctx, new_k), (v_ctx, new_v)):
+                    buf[:, nreg:].copy_(torch.roll(buf[:, nreg:], -1, dims=1))
+                    buf[:, -1:].copy_(new)
+            else:
                 streaming_kv_caches[i] = (
-                    torch.cat(
-                        [k_ctx[:, :n_register_tokens], k_ctx[:, n_register_tokens + 1 :], new_k],
-                        dim=1,
-                    ).clone(),
-                    torch.cat(
-                        [v_ctx[:, :n_register_tokens], v_ctx[:, n_register_tokens + 1 :], new_v],
-                        dim=1,
-                    ).clone(),
+                    torch.cat([k_ctx[:, :nreg], k_ctx[:, nreg + 1 :], new_k], dim=1).clone(),
+                    torch.cat([v_ctx[:, :nreg], v_ctx[:, nreg + 1 :], new_v], dim=1).clone(),
                 )
 
-        return z_t, streaming_kv_caches
+        return streaming_kv_caches
 
     def set_inference_context(self, n_context_frames: int) -> None:
         """Override how many frames the autoregressive rollout conditions on (inference-only).

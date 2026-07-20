@@ -124,6 +124,22 @@ def rollout(
     if n_frames is not None:
         n_iters = min(n_iters, n_frames)
 
+    # E1: whole-frame CUDA-graph replay (forces the ring cache). The runner is cached on the model
+    # keyed by the sampling knobs so the graph is captured once and reused across rollouts (e.g. the
+    # bench's warmup + timed rollouts) rather than re-captured each call. Falls back to eager on failure.
+    graph_runner = None
+    if config.cuda_graphs:
+        from mira.inference.cuda_graphs import FrameGraphRunner  # noqa: PLC0415
+
+        key = (config.n_diffusion_steps, config.noise_level, config.schedule_type)
+        if not hasattr(inner, "_graph_runners"):
+            inner._graph_runners = {}
+        graph_runner = inner._graph_runners.get(key)
+        if graph_runner is None:
+            graph_runner = FrameGraphRunner(inner, *key)
+            inner._graph_runners[key] = graph_runner
+    ring_cache = config.streaming_cache == "ring" or config.cuda_graphs
+
     streaming_kv_caches = None
     for start in tqdm(range(n_iters), desc="Diffusion rollout", disable=not progress_bar):
         current_a = _encode_window_actions(model, inner, batch, start, window_size)
@@ -134,6 +150,8 @@ def rollout(
             noise_level=config.noise_level,
             streaming_kv_caches=streaming_kv_caches,
             schedule_type=config.schedule_type,
+            ring_cache=ring_cache,
+            graph_runner=graph_runner,
         )
 
     return z_t

@@ -1,0 +1,253 @@
+"""Modal entrypoints to run the mira training/inference benchmarks on H100s.
+
+Mirrors the conventions in ``lewm-modal-fast/modal_app.py`` (Image -> Volume -> H100 functions ->
+local_entrypoints). The whole repo is baked into the image and installed editable; the DINOv3
+backbone code is pre-fetched at build time (``pretrained=False`` -- code only, no gated weights) so
+the random-init codec constructs without a runtime torch.hub round-trip.
+
+Every benchmark runs as a subprocess of the repo's own CLI (scripts/bench_*.py) so the local and
+remote code paths are identical and DDP works via torchrun.
+
+Quick start (see docs/benchmarking.md for the full matrix and how to read the numbers):
+    modal run scripts/modal_bench.py::infer
+    modal run scripts/modal_bench.py::train --mode dit --compile
+    modal run scripts/modal_bench.py::ablation
+    modal run scripts/modal_bench.py::ddp
+    modal run scripts/modal_bench.py::profile --mode dit
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import modal
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REMOTE_REPO = "/root/mira"
+SCRIPTS_DIR = f"{REMOTE_REPO}/scripts"
+
+
+def _prefetch_dino() -> None:
+    """Cache the DINOv3 hub repo + architecture at image-build time (no gated weights)."""
+    import torch
+
+    torch.hub.load(
+        repo_or_dir="facebookresearch/dinov3",
+        model="dinov3_vitl16",
+        source="github",
+        verbose=False,
+        pretrained=False,
+    )
+
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "build-essential", "ffmpeg")
+    # CUDA (cu128) torch + torchvision first, then CPU-decode torchcodec (its ABI must match torch;
+    # --no-deps keeps the cu128 torch build). Mirrors the repo's pixi setup. torchvision is installed
+    # here from the cu128 index so the later `[train]` -> lpips dependency is satisfied by an
+    # ABI-matched build rather than pulling a default-PyPI torchvision that mismatches cu128 torch.
+    .pip_install(
+        "torch==2.8.*", "torchvision==0.23.*", extra_index_url="https://download.pytorch.org/whl/cu128"
+    )
+    .run_commands(
+        "pip install --no-deps torchcodec==0.7.0 --index-url https://download.pytorch.org/whl/cpu"
+    )
+    .add_local_dir(
+        str(REPO_ROOT),
+        REMOTE_REPO,
+        copy=True,
+        ignore=["**/.git", "**/.pixi", "**/__pycache__", "**/*.lock", "**/.pytest_cache", "**/.benchmarks"],
+    )
+    .run_commands(f"pip install -e '{REMOTE_REPO}[train]'")
+    # FDD metric dep for the quality gate (scipy already comes via lpips). Not adding mira[eval]
+    # wholesale because that would reinstall torchcodec from the default index over the cpu build.
+    .pip_install("pytorch-fid")
+    # Category C: torchao weight-only int8/fp8 quantization. Pinned to a torch-2.8-era release so its
+    # CUDA kernels match (the latest torchao targets torch>=2.11 and silently skips its cpp extensions,
+    # which would make int8 fall back to a slow path). --no-deps keeps the cu128 torch build.
+    .run_commands("pip install --no-deps torchao==0.12.0")
+    .run_function(_prefetch_dino)
+)
+
+data_vol = modal.Volume.from_name("mira-bench-data", create_if_missing=True)
+
+app = modal.App("mira-bench", image=image)
+
+
+def _run(cmd: list[str], nproc: int | None = None, visible: str | None = None) -> str:
+    """Run a bench CLI as a subprocess in the scripts dir; optionally under torchrun for DDP."""
+    import os
+
+    env = os.environ.copy()
+    if visible is not None:
+        env["CUDA_VISIBLE_DEVICES"] = visible
+    if nproc and nproc > 1:
+        cmd = ["torchrun", "--standalone", f"--nproc_per_node={nproc}"] + cmd
+    else:
+        cmd = ["python"] + cmd
+    print(f"$ {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(cmd, cwd=SCRIPTS_DIR, env=env, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"benchmark subprocess failed ({proc.returncode})")
+    return "ok"
+
+
+# --------------------------------------------------------------------------- inference
+
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=3600)
+def infer(
+    n_diffusion_steps: str = "1 2 4 8",
+    n_frames: int = 16,
+    compile: bool = False,
+    tf32: bool = False,
+    batch: int = 1,
+    optim: str = "",
+    streaming_cache: str = "grow",
+    compile_mode: str = "default",
+    quantize: str = "none",
+    cuda_graphs: bool = False,
+    verify_graphs: bool = False,
+) -> None:
+    """Rollout latency + decode throughput + end-to-end, over the diffusion-step sweep."""
+    cmd = [
+        "bench_infer_speed.py",
+        "--n-diffusion-steps", *n_diffusion_steps.split(),
+        "--n-frames", str(n_frames),
+        "--batch", str(batch),
+        "--streaming-cache", streaming_cache,
+        "--compile-mode", compile_mode,
+        "--quantize", quantize,
+    ]
+    if compile:
+        cmd.append("--compile")
+    if cuda_graphs:
+        cmd.append("--cuda-graphs")
+    if verify_graphs:
+        cmd.append("--verify-graphs")
+    if tf32:
+        cmd.append("--tf32")
+    if optim:
+        cmd += ["--optim", optim]
+    _run(cmd)
+
+
+# --------------------------------------------------------------------------- training
+
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=3600)
+def train(
+    mode: str = "dit",
+    batch: int = 1,
+    steps: int = 30,
+    compile: bool = False,
+    tf32: bool = False,
+    activation_ckpt: bool = False,
+    size: str = "1b",
+) -> None:
+    """One training-throughput + MFU measurement (single H100)."""
+    cmd = ["bench_train_speed.py", "--mode", mode, "--batch", str(batch), "--steps", str(steps), "--size", size]
+    if compile:
+        cmd.append("--compile")
+    if tf32:
+        cmd.append("--tf32")
+    if activation_ckpt:
+        cmd.append("--activation-ckpt")
+    _run(cmd)
+
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=7200)
+def ablation(mode: str = "dit", batch: int = 1, steps: int = 30) -> None:
+    """The 'what did the engineering buy us' grid: baseline -> +compile -> +tf32 -> +act-ckpt."""
+    rows = [
+        ("baseline", []),
+        ("+compile", ["--compile"]),
+        ("+compile+tf32", ["--compile", "--tf32"]),
+        ("+compile+tf32+actckpt", ["--compile", "--tf32", "--activation-ckpt"]),
+    ]
+    for name, flags in rows:
+        print(f"\n===== {name} =====", flush=True)
+        _run(["bench_train_speed.py", "--mode", mode, "--batch", str(batch), "--steps", str(steps)] + flags)
+
+
+@app.function(gpu="H100:4", volumes={"/data": data_vol}, timeout=7200)
+def ddp(mode: str = "dit", batch: int = 1, steps: int = 30, compile: bool = False) -> None:
+    """DDP scaling: run the same per-GPU config on 1, 2, 4 H100s and print samples/s each."""
+    base = ["bench_train_speed.py", "--mode", mode, "--batch", str(batch), "--steps", str(steps), "--per-step-barrier"]
+    if compile:
+        base.append("--compile")
+    for n in (1, 2, 4):
+        print(f"\n===== {n} GPU(s) =====", flush=True)
+        _run(base, nproc=n, visible=",".join(str(i) for i in range(n)))
+
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=3600)
+def profile(mode: str = "dit", compile: bool = False, tf32: bool = False, trace: bool = True,
+            optim: str = "", streaming_cache: str = "grow") -> None:
+    """torch.profiler on one step; writes a Chrome trace to the volume when trace=True."""
+    cmd = ["bench_profile.py", "--mode", mode, "--streaming-cache", streaming_cache]
+    if compile:
+        cmd.append("--compile")
+    if tf32:
+        cmd.append("--tf32")
+    if optim:
+        cmd += ["--optim", optim]
+    if trace:
+        suffix = f"{mode}{'_compile' if compile else ''}{('_' + optim.replace(',', '')) if optim else ''}"
+        suffix += f"_{streaming_cache}" if streaming_cache != "grow" else ""
+        cmd += ["--trace-out", f"/data/trace_{suffix}.json"]
+    _run(cmd)
+    data_vol.commit()
+
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=7200)
+def optim_sweep(compile: bool = True, n_frames: int = 16, variants: str = "baseline,A1,A2,A3,A4,A5") -> None:
+    """Sweep the requested cast-reduction optims on inference latency, all vs the same model.
+
+    ``variants`` is a comma list (use ``baseline`` for the no-optim run); pass e.g.
+    ``--variants A3,A4,A5`` to only run the ones you don't already have. Prints one bench_infer_speed
+    JSON per variant. Runs with --compile by default (the optims stack on Inductor fusion, where the
+    residual ~50% cast cost lives)."""
+    for v in [s.strip() for s in variants.split(",") if s.strip()]:
+        optim = "" if v.lower() == "baseline" else v
+        print(f"\n===== optim={v} (compile={compile}) =====", flush=True)
+        cmd = ["bench_infer_speed.py", "--n-diffusion-steps", "1", "2", "4", "--n-frames", str(n_frames)]
+        if compile:
+            cmd.append("--compile")
+        if optim:
+            cmd += ["--optim", optim]
+        _run(cmd)
+
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=10800)
+def qualitycheck(checkpoint: str, optims: str = "baseline,A1,A2,A4,A5", num_samples: int = 256,
+                 n_diffusion_steps: int = 4, compile: bool = False) -> None:
+    """Quality gate: FDD/drift per optim variant on a REAL checkpoint (must be on the volume)."""
+    cmd = ["qualitycheck_optims.py", checkpoint, "--optims", optims,
+           "--num-samples", str(num_samples), "--n-diffusion-steps", str(n_diffusion_steps)]
+    if compile:
+        cmd.append("--compile")
+    _run(cmd)
+
+
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=7200)
+def dataloader_test(data_index: str, batch: int = 1, num_workers: int = 6, steps: int = 30) -> None:
+    """Cached-batch vs real-loader throughput (needs a clip index uploaded to the volume)."""
+    _run([
+        "bench_train_speed.py", "--mode", "full", "--dataloader-test",
+        "--data-index", data_index, "--batch", str(batch),
+        "--num-workers", str(num_workers), "--steps", str(steps),
+    ])
+
+
+# --------------------------------------------------------------------------- entrypoints
+
+
+@app.local_entrypoint()
+def main() -> None:
+    """Run the core matrix: inference sweep + training ablation. (Costs H100 time.)"""
+    infer.remote(compile=False)
+    infer.remote(compile=True)
+    ablation.remote(mode="dit")

@@ -59,7 +59,7 @@ class RoPE(nn.Module):
         grid = grid.transpose(0, 1)  # (T, n_rope)  # n_rope = 1 if only doing time
         return grid
 
-    def forward(
+    def _compute(
         self, n_frames: int, device: torch.device, offset: Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         grid = self._prepare_video_coords(n_frames, device=device, offset=offset)  # in seconds
@@ -77,6 +77,27 @@ class RoPE(nn.Module):
             sin_freqs = torch.cat([sin_padding, sin_freqs], dim=-1)
 
         return cos_freqs, sin_freqs
+
+    def enable_precompute(self, max_frames: int, device: torch.device | None = None) -> None:
+        """Precompute the cos/sin tables up to ``max_frames`` and slice per call (compile-friendly).
+
+        The default path recomputes the tables on every forward; under ``torch.compile`` a runtime
+        cache keyed on length triggers recompiles, whereas slicing a registered buffer does not. Only
+        the ``offset is None`` path (the world-model hot path) is served from the buffer.
+        """
+        # Compute on the module's own device (buffers like ``w`` may already be on cuda when this is
+        # enabled post-build); defaulting to CPU would mismatch them.
+        cos, sin = self._compute(max_frames, device=device or self.w.device)
+        self.register_buffer("_pre_cos", cos, persistent=False)
+        self.register_buffer("_pre_sin", sin, persistent=False)
+
+    def forward(
+        self, n_frames: int, device: torch.device, offset: Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pre_cos = getattr(self, "_pre_cos", None)
+        if offset is None and pre_cos is not None and n_frames <= pre_cos.shape[0]:
+            return pre_cos[:n_frames], self._pre_sin[:n_frames]
+        return self._compute(n_frames, device=device, offset=offset)
 
 
 class SpatialRoPE2D(nn.Module):
@@ -112,7 +133,7 @@ class SpatialRoPE2D(nn.Module):
         sin = freqs.sin().repeat_interleave(2, dim=-1)
         return cos, sin
 
-    def forward(self, height: int, width: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute(self, height: int, width: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         cos_y, sin_y = self._axis_cos_sin(height, device)  # (height, dim // 2)
         cos_x, sin_x = self._axis_cos_sin(width, device)  # (width, dim // 2)
 
@@ -122,3 +143,17 @@ class SpatialRoPE2D(nn.Module):
         cos = torch.cat([cos_y, cos_x], dim=-1).reshape(height * width, self.dim)
         sin = torch.cat([sin_y, sin_x], dim=-1).reshape(height * width, self.dim)
         return cos, sin
+
+    def enable_precompute(self, height: int, width: int, device: torch.device | None = None) -> None:
+        """Precompute the (fixed) spatial cos/sin grid so forward returns a registered buffer, not a
+        fresh recompute -- compile-friendly (see :meth:`RoPE.enable_precompute`)."""
+        # Compute on the module's own device (see RoPE.enable_precompute); inv_freq may be on cuda.
+        cos, sin = self._compute(height, width, device or self.inv_freq.device)
+        self._pre_hw = (height, width)
+        self.register_buffer("_pre_cos", cos, persistent=False)
+        self.register_buffer("_pre_sin", sin, persistent=False)
+
+    def forward(self, height: int, width: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if getattr(self, "_pre_cos", None) is not None and getattr(self, "_pre_hw", None) == (height, width):
+            return self._pre_cos, self._pre_sin
+        return self._compute(height, width, device)

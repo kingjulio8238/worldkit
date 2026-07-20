@@ -66,6 +66,12 @@ class DiffusionTransformer(nn.Module):
         # across codecs so a model can warm-start from another temporal stride, not the codec's
         # actual latent rate (video.fps / temporal_downsampling).
         self.rope = RoPE(dim=head_dim)
+        # A3: precompute the RoPE tables (compile-friendly). Temporal length is bounded by the latent
+        # window + register tokens (+margin); spatial is the fixed single-player latent grid. Any
+        # forward that exceeds these (e.g. a multiplayer tiled grid) falls back to recompute.
+        if config.rope_precompute:
+            self.rope.enable_precompute(self.n_latent_frames + self.n_register_tokens + 4)
+            self.spatial_rope.enable_precompute(self.latent_height, self.latent_width)
 
         self.diffusion_time_embedding = DiffusionTimeEmbedding(dim=hidden_dim)
         # Embedding of the integration-step size tau_delta, used by the PSD-M loss. Only created
@@ -86,6 +92,8 @@ class DiffusionTransformer(nn.Module):
                         num_heads=config.n_head,
                         num_kv_heads=config.n_kv_head,
                         gating=config.attention_gating,
+                        qk_norm_fused=config.qk_norm_fused,
+                        rope_upcast=config.rope_upcast,
                     ),
                     cond_dim=hidden_dim,
                     causal=config.causal,

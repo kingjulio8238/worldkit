@@ -80,6 +80,22 @@ class LatentWorldModelConfig(BaseModel):
     n_layers: int = 16
     time_attention_every: int = 1
 
+    # --- Inference RoPE/QK-norm optimizations. Only A3 (rope_precompute) is on by default: it is a
+    # bit-exact −22% per-frame denoise win on H100 (see docs/optimization_plan.md). A1/A2 are off:
+    # the de-noised benchmark showed A1 is within noise and A2 (bf16 RoPE, a precision change) is
+    # redundant once RoPE tables are precomputed. ---
+    # A1: compute QK-norm via the fused F.layer_norm/F.rms_norm kernel (in-kernel fp32 accum, no
+    # materialized fp32 tensor) instead of the explicit fp32 round-trip. No measured benefit under
+    # compile; left off.
+    qk_norm_fused: bool = False
+    # A2: apply RoPE without upcasting q/k to fp32 (rotate in the input dtype). Set False for bf16 RoPE.
+    # Off by default (a precision change that adds nothing on top of A3).
+    rope_upcast: bool = True
+    # A3: precompute the RoPE cos/sin tables into buffers and slice per call. Bit-exact and
+    # compile-friendly (the recompute path triggers torch.compile recompiles from a runtime cache).
+    # On by default -- the measured, precision-preserving inference win.
+    rope_precompute: bool = True
+
     @property
     def psd_enabled(self) -> bool:
         """Whether the PSD-M loss is active (via either the stochastic or weighted path)."""
@@ -101,3 +117,11 @@ class WorldModelInferenceConfig(BaseModel):
     noise_level: float | None = 0.2
     # Sampling-schedule shape: "linear_quadratic" (default) or "linear" (uniform).
     schedule_type: str = "linear_quadratic"
+    # Streaming KV-cache backing (B1). "grow" (default) rebuilds the per-layer cache with cat+clone
+    # each frame; "ring" updates a fixed preallocated buffer in place (bit-exact, static shape --
+    # infrastructure for CUDA-graph capture, E1). See docs/optimization_plan.md.
+    streaming_cache: Literal["grow", "ring"] = "grow"
+    # E1: capture the whole per-frame denoise (all diffusion steps + kv-update + ring rotation) into a
+    # CUDA graph and replay it, eliminating per-kernel launch overhead. Requires a fixed cache
+    # (forces "ring"), single-player, n_register_tokens==0, PSD off. Default off. See E1 in the plan.
+    cuda_graphs: bool = False
