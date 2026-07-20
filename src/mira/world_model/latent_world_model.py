@@ -471,6 +471,8 @@ class LatentWorldModel(nn.Module):
         actions_history: ActionTensors,
         streaming_kv_cache=None,
         config: WorldModelInferenceConfig | None = None,
+        graph_runner=None,
+        ring_cache: bool = False,
     ):
         if config is None:
             config = WorldModelInferenceConfig()
@@ -507,6 +509,8 @@ class LatentWorldModel(nn.Module):
             n_diffusion_steps=config.n_diffusion_steps,
             noise_level=config.noise_level,
             schedule_type=config.schedule_type,
+            ring_cache=ring_cache or config.cuda_graphs,
+            graph_runner=graph_runner,
         )
 
     @torch.no_grad()
