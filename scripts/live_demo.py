@@ -72,7 +72,7 @@ class LiveSession:
     the newest video frame(s) plus the measured GPU time.
     """
 
-    def __init__(self, models: dict, seed_batches: list, device):
+    def __init__(self, models: dict, seed_batches: list, device, mode: str = "optimized"):
         import torch  # noqa: PLC0415
 
         self.torch = torch
@@ -80,7 +80,7 @@ class LiveSession:
         self.seed_batches = seed_batches
         self.device = device
         self.seed_idx = 0
-        self.set_mode("optimized")
+        self.set_mode(mode)
 
     def set_mode(self, mode: str) -> None:
         """Switch optimized/baseline and re-bootstrap the world from the current seed clip."""
@@ -223,7 +223,8 @@ def _load_models(device):
 
 # --------------------------------------------------------------------------- ASGI app
 
-SESSION = None  # one interactive session per (single) container
+OPT_SESSION = None   # optimized (2-step PSD + graphs)
+BASE_SESSION = None  # released baseline (10-step, eager)
 
 
 @app.function(gpu="H100", volumes={"/data": data_vol}, timeout=3600,
@@ -245,17 +246,18 @@ def web():
     print("Loading models (this warms both checkpoints)...", flush=True)
     models, seeds = _load_models(device)
 
-    global SESSION
-    SESSION = LiveSession(models, seeds, device)
-    # Warm at startup so the first user interaction is snappy: this triggers the optimized-path compile
-    # + graph capture and the baseline eager path. Any bug in step()/decode surfaces HERE, before the
-    # URL goes live -- read the logs above "Ready:".
-    print("Warming optimized path (torch.compile + CUDA-graph capture, ~1-2 min)...", flush=True)
+    global OPT_SESSION, BASE_SESSION
+    # Two sessions from the SAME seed clip: same keystrokes drive both, so it's the same scene, ours vs
+    # released, side by side. (They're stepped sequentially per request -> the shared CUDA-graph buffers
+    # are never used concurrently.)
+    OPT_SESSION = LiveSession(models, seeds, device, mode="optimized")
+    BASE_SESSION = LiveSession(models, seeds, device, mode="baseline")
+    # Warm at startup so the first interaction is snappy (optimized compile + graph capture). Any bug in
+    # step()/decode surfaces HERE, before the URL goes live -- read the logs above "Ready.".
+    print("Warming (torch.compile + CUDA-graph capture, ~1-2 min)...", flush=True)
     for _ in range(2):
-        SESSION.step([])
-    SESSION.set_mode("baseline")
-    SESSION.step([])
-    SESSION.set_mode("optimized")
+        OPT_SESSION.step([])
+    BASE_SESSION.step([])
     print("Ready. URL is live; drive with WASD.", flush=True)
 
     fapp = FastAPI()
@@ -264,36 +266,32 @@ def web():
     def index():
         return HTMLResponse(HTML)
 
+    def _panel(session, keys: list[int]) -> dict:
+        frame, ms = session.step(keys)
+        buf = io.BytesIO()
+        Image.fromarray(frame).save(buf, format="JPEG", quality=80)
+        fps = 1000.0 / ms * session.td
+        return {
+            "frame": base64.b64encode(buf.getvalue()).decode(),
+            "ms": round(ms, 1), "fps": round(fps, 1),
+            "rt": round(fps / session.model.config.video.fps, 2),
+            "fpd": int(fps * 3600.0 / H100_USD_PER_HR),
+            "steps": session.cfg.n_diffusion_steps,
+        }
+
     def _process(body: dict) -> dict:
         """All the (blocking) GPU work; run in a threadpool so the event loop stays free."""
         try:
             cmd = body.get("cmd")
-            if cmd == "mode":
-                SESSION.set_mode(body.get("mode") or "optimized")
-                SESSION.step([])  # recapture graph for the newly selected mode
-                return {"event": "mode", "mode": SESSION.mode}
             if cmd == "reset":
-                SESSION.reset()
+                OPT_SESSION.reset(); BASE_SESSION.reset()
                 return {"event": "reset"}
             if cmd == "seed":
-                SESSION.next_seed()
-                return {"event": "seed", "idx": SESSION.seed_idx}
-
-            frame, gpu_ms = SESSION.step(body.get("keys", []))
-            img = Image.fromarray(frame)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=80)
-            b64 = base64.b64encode(buf.getvalue()).decode()
-
-            gen_fps = 1000.0 / gpu_ms * SESSION.td
-            x_realtime = gen_fps / SESSION.model.config.video.fps
-            frames_per_usd = gen_fps * 3600.0 / H100_USD_PER_HR
-            return {
-                "frame": b64, "mode": SESSION.mode,
-                "gpu_ms": round(gpu_ms, 1), "gen_fps": round(gen_fps, 1),
-                "x_realtime": round(x_realtime, 2), "frames_per_usd": int(frames_per_usd),
-                "n_steps": SESSION.cfg.n_diffusion_steps,
-            }
+                OPT_SESSION.next_seed(); BASE_SESSION.next_seed()
+                return {"event": "seed", "idx": OPT_SESSION.seed_idx}
+            keys = body.get("keys", [])
+            # Same keys drive both -> same scene, diverging only by model + step count.
+            return {"opt": _panel(OPT_SESSION, keys), "base": _panel(BASE_SESSION, keys)}
         except Exception as exc:  # noqa: BLE001 -- surface errors to the client for live debugging
             traceback.print_exc()
             return {"event": "error", "detail": f"{type(exc).__name__}: {exc}"}
@@ -314,61 +312,88 @@ def web():
 # --------------------------------------------------------------------------- browser UI
 
 HTML = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>MIRA-Mini - live</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MIRA-Mini - live</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin:0; background:#0b0d10; color:#e8eef2; font:14px/1.4 ui-sans-serif,system-ui,sans-serif;
-         display:flex; flex-direction:column; align-items:center; gap:16px; padding:20px; }
-  h1 { font-size:18px; margin:4px 0; font-weight:600; }
-  .sub { color:#8a97a3; margin:0 0 6px; }
-  #stage { position:relative; width:640px; max-width:96vw; aspect-ratio:16/9; background:#000;
-           border:1px solid #22282e; border-radius:10px; overflow:hidden; }
+  :root { color-scheme: dark; --bg:#0a0c0f; --panel:#0f1318; --line:#20262d; --dim:#7c8894; --fg:#eef3f7;
+          --green:#43e296; --amber:#f0a55e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); padding:24px 16px 40px;
+         font:14px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:18px; }
+  header { text-align:center; }
+  h1 { font-size:20px; margin:0 0 4px; font-weight:650; letter-spacing:-.01em; }
+  .sub { color:var(--dim); margin:0; font-size:13px; }
+  .panels { display:flex; gap:20px; width:100%; max-width:1080px; justify-content:center; flex-wrap:wrap; }
+  .panel { flex:1 1 460px; max-width:520px; }
+  .view { position:relative; aspect-ratio:16/9; background:#000; border:1px solid var(--line);
+          border-radius:12px; overflow:hidden; }
+  .view.opt  { border-color:#1d5b45; box-shadow:0 0 0 1px #12281f, 0 8px 30px -12px #0d3b2a; }
+  .view.base { border-color:#5b3a1d; box-shadow:0 0 0 1px #281c12, 0 8px 30px -12px #3b2a0d; }
   canvas { width:100%; height:100%; display:block; }
-  #hud { position:absolute; top:10px; left:10px; display:grid; grid-template-columns:auto auto; gap:2px 14px;
-         background:rgba(8,10,13,.72); padding:10px 14px; border-radius:8px; font-variant-numeric:tabular-nums;
-         backdrop-filter:blur(4px); }
-  #hud .k { color:#8a97a3; } #hud .v { text-align:right; font-weight:600; }
-  #hud .big { font-size:18px; }
-  .badge { position:absolute; top:10px; right:10px; padding:4px 10px; border-radius:999px; font-weight:600;
-           font-size:12px; }
-  .opt { background:#0e3b2e; color:#4ade9b; border:1px solid #1c6b52; }
-  .base { background:#3b1e0e; color:#f0a662; border:1px solid #6b451c; }
-  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center; }
-  button { background:#161b21; color:#e8eef2; border:1px solid #2a323a; border-radius:8px; padding:8px 14px;
-           font:inherit; cursor:pointer; }
-  button:hover { border-color:#3a444e; } button.on { background:#12351f; border-color:#1c6b52; color:#4ade9b; }
-  .keys { color:#8a97a3; font-size:12px; }
-  kbd { background:#161b21; border:1px solid #2a323a; border-bottom-width:2px; border-radius:4px;
-        padding:1px 6px; color:#cdd7df; }
-  #status { color:#8a97a3; min-height:18px; }
-  .cmp { color:#8a97a3; font-size:12px; } .cmp b { color:#e8eef2; }
+  .label { display:flex; align-items:center; gap:8px; margin:12px 2px 8px; font-weight:650; font-size:15px; }
+  .dot { width:9px; height:9px; border-radius:50%; }
+  .opt .dot, .l-opt .dot { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .base .dot, .l-base .dot { background:var(--amber); box-shadow:0 0 8px var(--amber); }
+  .label small { color:var(--dim); font-weight:500; font-size:12px; }
+  .metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line);
+             border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .metric { background:var(--panel); padding:10px 12px; }
+  .metric .n { font-size:20px; font-weight:680; font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+  .l-opt .metric .n { color:var(--green); } .l-base .metric .n { color:var(--amber); }
+  .metric .u { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em; margin-top:2px; }
+  .summary { font-size:15px; color:var(--dim); text-align:center; min-height:22px; }
+  .summary b { color:var(--fg); font-weight:680; }
+  .summary .hi { color:var(--green); }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  button { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:9px;
+           padding:9px 16px; font:inherit; cursor:pointer; transition:border-color .15s; }
+  button:hover { border-color:#3a444e; }
+  .keys { color:var(--dim); font-size:12px; text-align:center; }
+  kbd { background:var(--panel); border:1px solid var(--line); border-bottom-width:2px; border-radius:4px;
+        padding:1px 6px; color:#cbd5dd; font-size:11px; }
+  #status { color:var(--dim); font-size:12px; min-height:16px; }
 </style></head>
 <body>
-  <h1>MIRA-Mini &middot; live world model</h1>
-  <p class="sub">Drive it. Toggle our optimized inference vs the released baseline. Metrics measured on the H100.</p>
-  <div id="stage">
-    <canvas id="cv" width="640" height="360"></canvas>
-    <div id="badge" class="badge opt">OURS &middot; 2-step PSD + graphs</div>
-    <div id="hud">
-      <div class="k big">gen fps</div><div class="v big" id="fps">-</div>
-      <div class="k">ms / frame</div><div class="v" id="ms">-</div>
-      <div class="k">x realtime</div><div class="v" id="rt">-</div>
-      <div class="k">frames / $</div><div class="v" id="fpd">-</div>
-      <div class="k">diffusion steps</div><div class="v" id="steps">-</div>
+  <header>
+    <h1>MIRA-Mini &middot; live world model</h1>
+    <p class="sub">Same scene, same controls. Our optimized inference vs the released baseline &mdash; measured live on one H100.</p>
+  </header>
+
+  <div class="panels">
+    <div class="panel l-opt">
+      <div class="view opt"><canvas id="cv-opt" width="640" height="360"></canvas></div>
+      <div class="label opt"><span class="dot"></span>Ours <small>&mdash; 2-step PSD + torch.compile + CUDA graphs</small></div>
+      <div class="metrics">
+        <div class="metric"><div class="n" id="opt-fps">&ndash;</div><div class="u">gen fps</div></div>
+        <div class="metric"><div class="n" id="opt-ms">&ndash;</div><div class="u">ms / frame</div></div>
+        <div class="metric"><div class="n" id="opt-rt">&ndash;</div><div class="u">&times; realtime</div></div>
+        <div class="metric"><div class="n" id="opt-fpd">&ndash;</div><div class="u">frames / $</div></div>
+      </div>
+    </div>
+    <div class="panel l-base">
+      <div class="view base"><canvas id="cv-base" width="640" height="360"></canvas></div>
+      <div class="label base"><span class="dot"></span>Released <small>&mdash; 10-step base, eager</small></div>
+      <div class="metrics">
+        <div class="metric"><div class="n" id="base-fps">&ndash;</div><div class="u">gen fps</div></div>
+        <div class="metric"><div class="n" id="base-ms">&ndash;</div><div class="u">ms / frame</div></div>
+        <div class="metric"><div class="n" id="base-rt">&ndash;</div><div class="u">&times; realtime</div></div>
+        <div class="metric"><div class="n" id="base-fpd">&ndash;</div><div class="u">frames / $</div></div>
+      </div>
     </div>
   </div>
-  <div class="row">
-    <button id="btn-opt" class="on">Ours (2-step PSD + graphs)</button>
-    <button id="btn-base">Released (10-step, eager)</button>
+
+  <div class="summary" id="summary">warming up&hellip;</div>
+  <div class="controls">
     <button id="btn-reset">Reset world</button>
     <button id="btn-seed">New scene</button>
   </div>
-  <div class="cmp" id="cmp"></div>
   <div class="keys">
-    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive &middot;
-    <kbd>Q</kbd><kbd>E</kbd> air-roll &middot; <kbd>Space</kbd> ball-cam &middot; <kbd>Shift</kbd> boost &middot; <kbd>Ctrl</kbd>
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive &middot; <kbd>Q</kbd><kbd>E</kbd> air-roll &middot;
+    <kbd>Space</kbd> ball-cam &middot; <kbd>Shift</kbd> boost &middot; <kbd>Ctrl</kbd>
   </div>
-  <div id="status">connecting...</div>
+  <div id="status">connecting&hellip;</div>
+
 <script>
 // Key vocab order must match DEFAULT_RL_KEYS in mira/data/actions.py.
 const VOCAB = ["W","A","S","D","Q","E","Space","LShiftKey","LControlKey"];
@@ -376,11 +401,13 @@ const CODE2KEY = {KeyW:"W",KeyA:"A",KeyS:"S",KeyD:"D",KeyQ:"Q",KeyE:"E",
                   Space:"Space",ShiftLeft:"LShiftKey",ShiftRight:"LShiftKey",
                   ControlLeft:"LControlKey",ControlRight:"LControlKey"};
 const held = new Set();
-const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
-const img = new Image();
-const best = {opt:null, base:null};
 const $ = id => document.getElementById(id);
-let mode = "optimized", running = true;
+const ctx = {opt: $("cv-opt").getContext("2d"), base: $("cv-base").getContext("2d")};
+const imgs = {opt: new Image(), base: new Image()};
+imgs.opt.onload  = () => ctx.opt.drawImage(imgs.opt, 0, 0, 640, 360);
+imgs.base.onload = () => ctx.base.drawImage(imgs.base, 0, 0, 640, 360);
+let running = true;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function keyIdxs(){ return [...held].map(k => VOCAB.indexOf(k)).filter(i => i>=0); }
 addEventListener("keydown", e => { const k=CODE2KEY[e.code]; if(k){ held.add(k); e.preventDefault(); }});
@@ -391,47 +418,30 @@ async function post(body){
                                   body: JSON.stringify(body)});
   return r.json();
 }
-function draw(m){
-  img.onload = () => ctx.drawImage(img, 0, 0, cv.width, cv.height);
-  img.src = "data:image/jpeg;base64," + m.frame;
-  $("fps").textContent = m.gen_fps.toFixed(1);
-  $("ms").textContent  = m.gpu_ms.toFixed(1) + " ms";
-  $("rt").textContent  = m.x_realtime.toFixed(2) + "x";
-  $("fpd").textContent = m.frames_per_usd.toLocaleString();
-  $("steps").textContent = m.n_steps;
-  best[mode==="optimized"?"opt":"base"] = m;
-  const o = best.opt, b = best.base;
-  if(o && b){
-    $("cmp").innerHTML = "Ours vs Released: <b>" + (o.gen_fps/b.gen_fps).toFixed(1) + "x faster</b> ("
-      + o.gen_fps + " vs " + b.gen_fps + " fps) &middot; <b>"
-      + (o.frames_per_usd/b.frames_per_usd).toFixed(1) + "x more frames per dollar</b>";
-  }
+function paint(which, m){
+  imgs[which].src = "data:image/jpeg;base64," + m.frame;
+  $(which+"-fps").textContent = m.fps.toFixed(1);
+  $(which+"-ms").textContent  = m.ms.toFixed(1);
+  $(which+"-rt").textContent  = m.rt.toFixed(2) + "x";
+  $(which+"-fpd").textContent = m.fpd >= 1000 ? Math.round(m.fpd/1000) + "k" : m.fpd;
 }
 async function loop(){
-  $("status").textContent = "connected - click the page and drive with WASD";
+  $("status").textContent = "live - click the page and drive with WASD";
   while(running){
     try {
-      const m = await post({keys: keyIdxs()});
-      if(m.event === "error"){ $("status").textContent = "server error: " + m.detail; await sleep(1000); }
-      else if(m.frame){ draw(m); }
+      const r = await post({keys: keyIdxs()});
+      if(r.event === "error"){ $("status").textContent = "server error: " + r.detail; await sleep(1000); continue; }
+      if(r.opt && r.base){
+        paint("opt", r.opt); paint("base", r.base);
+        const sx = (r.opt.fps / r.base.fps).toFixed(1), cx = (r.opt.fpd / r.base.fpd).toFixed(1);
+        $("summary").innerHTML = "Ours generates <b class='hi'>" + sx + "&times; more frames per second</b> and <b class='hi'>"
+          + cx + "&times; more frames per dollar</b> &mdash; " + r.opt.steps + " diffusion steps vs " + r.base.steps + ".";
+      }
     } catch(e){ $("status").textContent = "network error: " + e; await sleep(500); }
   }
 }
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-async function setMode(m){
-  mode = m;
-  await post({cmd:"mode", mode:m});
-  const opt = m === "optimized";
-  $("btn-opt").classList.toggle("on", opt); $("btn-base").classList.toggle("on", !opt);
-  const badge = $("badge");
-  badge.className = "badge " + (opt ? "opt" : "base");
-  badge.textContent = opt ? "OURS - 2-step PSD + graphs" : "RELEASED - 10-step, eager";
-}
-$("btn-opt").onclick  = () => setMode("optimized");
-$("btn-base").onclick = () => setMode("baseline");
-$("btn-reset").onclick= () => post({cmd:"reset"});
-$("btn-seed").onclick = () => post({cmd:"seed"});
+$("btn-reset").onclick = () => post({cmd:"reset"});
+$("btn-seed").onclick  = () => post({cmd:"seed"});
 loop();
 </script>
 </body></html>
