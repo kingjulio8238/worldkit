@@ -65,6 +65,15 @@ class LatentWorldModelConfig(BaseModel):
 
     n_register_tokens: int = 0
 
+    # Multiplayer scaling. The multiplayer wrapper tiles n_players clips into one grid (stacked along
+    # height); "global" spatial attention over all p*h*w tokens is O(p^2). "tile_local" runs
+    # block-diagonal spatial attention within each player's tile + a cheap cross-player mixer over
+    # pooled per-tile summaries -> O(p). n_spatial_tiles is how many player tiles the height splits into
+    # (set by MultiWrapperWorldModel = n_players; 1 = single grid, tile_local is a no-op). Default
+    # "global" preserves the shipped single-player and multiplayer behaviour exactly.
+    spatial_attention: Literal["global", "tile_local"] = "global"
+    n_spatial_tiles: int = 1
+
     patch_size: int = 1
     attention_gating: bool = False
     # If True, apply AdaLN conditioning to the attention sublayers (space/time) as well as the MLP,

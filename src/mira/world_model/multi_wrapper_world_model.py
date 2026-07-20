@@ -66,6 +66,9 @@ class MultiWrapperWorldModel(nn.Module):
         original_height = config.wm_config.video.height
         wm_config = config.wm_config.model_copy(deep=True)
         wm_config.video.height *= config.n_players
+        # Tell the inner DiT how many player tiles the (now p*h) height splits into, so tile_local
+        # spatial attention is block-diagonal per player. No-op when spatial_attention="global".
+        wm_config.n_spatial_tiles = config.n_players
         self.single_world_model = LatentWorldModel(wm_config)
         self.single_world_model.codec.config.encoder.video.height = original_height
 

@@ -81,6 +81,7 @@ def build_random_world_model(
     codec_config_name: str = "raev2_codec_tdown",
     latent_mean_std: tuple[float, float] = (0.0, 1.0),
     wm_config_overrides: dict | None = None,
+    video_height: int | None = None,
 ):
     """Construct a random-init :class:`LatentWorldModel` with a random-init frozen codec.
 
@@ -99,6 +100,10 @@ def build_random_world_model(
     wm_cfg_dict["latent_mean_std"] = list(latent_mean_std)
     if wm_config_overrides:
         wm_cfg_dict.update(wm_config_overrides)  # e.g. the A1-A3 optimization flags
+    if video_height is not None:
+        # Emulate the multiplayer tiled grid: a p*height frame -> a p-times-taller latent grid, which
+        # is what the DiT's spatial attention sees (the codec runs per-player in the real wrapper).
+        wm_cfg_dict["video"]["height"] = video_height
     wm_config = LatentWorldModelConfig.model_validate(wm_cfg_dict)
 
     codec_cfg = _load_codec_config(codec_config_name)

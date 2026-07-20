@@ -99,6 +99,8 @@ class DiffusionTransformer(nn.Module):
                     causal=config.causal,
                     time_attention=has_time_attention(i, config.n_layers),
                     ada_attn_ln=config.ada_attn_ln,
+                    spatial_attention=config.spatial_attention,
+                    n_spatial_tiles=config.n_spatial_tiles,
                 )
                 for i in range(config.n_layers)
             ]

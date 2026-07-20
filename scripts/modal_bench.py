@@ -147,6 +147,19 @@ def infer(
     _run(cmd)
 
 
+@app.function(gpu="H100", volumes={"/data": data_vol}, timeout=7200)
+def multiplayer(n_players: str = "1 2 4 8 16", modes: str = "global tile_local",
+                n_diffusion_steps: int = 4, compile: bool = False, tf32: bool = False) -> None:
+    """Player-count scaling: global O(p^2) vs tile_local O(p) spatial attention (random-init)."""
+    cmd = ["bench_multiplayer.py", "--n-players", *n_players.split(), "--modes", *modes.split(),
+           "--n-diffusion-steps", str(n_diffusion_steps)]
+    if compile:
+        cmd.append("--compile")
+    if tf32:
+        cmd.append("--tf32")
+    _run(cmd)
+
+
 # --------------------------------------------------------------------------- training
 
 

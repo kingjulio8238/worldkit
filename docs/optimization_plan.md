@@ -473,3 +473,33 @@ the reconstruction metrics improve at fewer steps, the perception–distortion t
 GREEN (2: PSD@2 ≈ base@10) + PSD graph bit-exact (3) + 24.7 ms 2-step measured (4) + serving default
 flipped & preset shipped (5). **Net inference result: ~7.0× vs the released 10-step base, matched
 quality**, via 2-step PSD + compile + A3 + CUDA graphs. Adopt with `configs/serve_psd_2step.yaml`.
+
+---
+
+# Multiplayer scaling — tile-local spatial attention (O(p²) → O(p))
+
+MIRA's multiplayer wrapper tiles `p` players into one grid (stacked along height) and runs one shared
+DiT over it. The **spatial** self-attention (`layers/transformer.py`) is over all `p·h·w` tokens →
+**O(p²)** — the wall on player count. (Temporal attention, MLPs, codec, KV-cache memory are all O(p).)
+
+**Prototype (behind a config flag, default off):** `spatial_attention: "global" | "tile_local"` on
+`LatentWorldModelConfig` (+ `n_spatial_tiles`, set by the wrapper = `n_players`).
+- **tile_local:** block-diagonal spatial attention *within* each player's tile (batch the tile axis;
+  RoPE is relative so tile-0's slice serves every tile) → the O(p) core, **plus** a cheap cross-player
+  mixer: mean-pool each tile to `p` summaries, attend over just those `p` tokens, broadcast back. So
+  players still exchange information, at O(p) instead of O(p²).
+- **Default "global" is bit-unchanged** (verified in tests); tile_local is player-permutation
+  *equivariant* (block-diagonal + symmetric mixer) — the structural check that it's really tiled.
+- Warm-starts from a global checkpoint: the per-tile `space_attn` weights transfer; only the small
+  `player_attn` mixer is new.
+
+**Benchmark:** `scripts/bench_multiplayer.py` builds a random model whose latent grid is `p×` taller
+and measures per-frame denoise latency for global vs tile_local across `p ∈ {1,2,4,8,16}`, reporting
+the empirical scaling exponent `k` (ms ~ p^k; global → k≈2, tile_local → k≈1). Modal:
+`modal run scripts/modal_bench.py::multiplayer --compile`. The quadratic gap only opens once tokens
+per frame exceed the hidden dim (roughly p≥8 at MIRA's latent sizes), which the sweep exposes.
+
+**Tie-in with E2:** the 2-step PSD cut is player-count-independent (constant-factor on the whole
+forward), and multiplayer is compute-bound (unlike launch-bound single-player), so the shelved
+compute-bound optims (int8/fp8, tier C) start paying off here. tile_local is the architectural lever
+that turns "4 players" into "scales with players".
