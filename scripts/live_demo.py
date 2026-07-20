@@ -336,108 +336,58 @@ def web():
 
 HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MIRA-Mini - live</title>
+<title>live</title>
 <style>
-  :root { color-scheme: dark; --bg:#0a0c0f; --panel:#0f1318; --line:#20262d; --dim:#7c8894; --fg:#eef3f7;
-          --green:#43e296; --amber:#f0a55e; }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); padding:24px 16px 40px;
+  body { margin:0; background:#fff; color:#000; padding:28px 16px 44px;
          font:14px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif;
-         display:flex; flex-direction:column; align-items:center; gap:18px; }
-  header { text-align:center; }
-  h1 { font-size:20px; margin:0 0 4px; font-weight:650; letter-spacing:-.01em; }
-  .sub { color:var(--dim); margin:0; font-size:13px; }
-  .panels { display:flex; gap:20px; width:100%; max-width:1080px; justify-content:center; flex-wrap:wrap; }
-  .panel { flex:1 1 460px; max-width:520px; }
-  .view { position:relative; aspect-ratio:16/9; background:#000; border:1px solid var(--line);
+         display:flex; flex-direction:column; align-items:center; gap:20px; }
+  .panels { display:flex; gap:20px; width:100%; max-width:1120px; justify-content:center; flex-wrap:wrap; }
+  .panel { flex:1 1 480px; max-width:540px; }
+  .view { position:relative; aspect-ratio:16/9; background:#000; border:1px solid #000;
           border-radius:12px; overflow:hidden; }
-  .view.opt  { border-color:#1d5b45; box-shadow:0 0 0 1px #12281f, 0 8px 30px -12px #0d3b2a; }
-  .view.base { border-color:#5b3a1d; box-shadow:0 0 0 1px #281c12, 0 8px 30px -12px #3b2a0d; }
   canvas { width:100%; height:100%; display:block; }
   .overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-             background:rgba(6,8,11,.5); backdrop-filter:blur(2px); cursor:pointer; }
+             background:rgba(255,255,255,.66); cursor:pointer; }
   .overlay.hidden { display:none; }
-  .play { font-size:15px; font-weight:650; padding:12px 22px; border-radius:10px; background:rgba(15,19,24,.9);
-          border:1px solid var(--line); color:var(--fg); cursor:pointer; display:flex; gap:8px; align-items:center; }
-  .opt .play { border-color:var(--green); color:var(--green); }
-  .base .play { border-color:var(--amber); color:var(--amber); }
-  .live-tag { position:absolute; top:10px; left:10px; font-size:11px; font-weight:650; padding:3px 8px;
-              border-radius:999px; display:none; }
-  .live-tag.on { display:block; }
-  .opt .live-tag { background:#0e3b2e; color:var(--green); } .base .live-tag { background:#3b1e0e; color:var(--amber); }
-  .label { display:flex; align-items:center; gap:8px; margin:12px 2px 8px; font-weight:650; font-size:15px; }
-  .dot { width:9px; height:9px; border-radius:50%; }
-  .opt .dot, .l-opt .dot { background:var(--green); box-shadow:0 0 8px var(--green); }
-  .base .dot, .l-base .dot { background:var(--amber); box-shadow:0 0 8px var(--amber); }
-  .label small { color:var(--dim); font-weight:500; font-size:12px; }
-  .metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--line);
-             border:1px solid var(--line); border-radius:10px; overflow:hidden; }
-  .metric { background:var(--panel); padding:10px 12px; }
-  .metric .n { font-size:20px; font-weight:680; font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
-  .l-opt .metric .n { color:var(--green); } .l-base .metric .n { color:var(--amber); }
-  .metric .u { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em; margin-top:2px; }
-  .summary { font-size:15px; color:var(--dim); text-align:center; min-height:22px; }
-  .summary b { color:var(--fg); font-weight:680; }
-  .summary .hi { color:var(--green); }
+  .play { font:inherit; font-size:15px; font-weight:650; padding:12px 22px; border-radius:10px;
+          background:#fff; border:1px solid #000; color:#000; cursor:pointer; }
+  .play:hover { background:#000; color:#fff; }
+  .summary { font-size:15px; color:#000; text-align:center; min-height:22px; }
+  .summary b { font-weight:750; }
   .controls { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
-  button { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:9px;
-           padding:9px 16px; font:inherit; cursor:pointer; transition:border-color .15s; }
-  button:hover { border-color:#3a444e; }
-  .keys { color:var(--dim); font-size:12px; text-align:center; }
-  kbd { background:var(--panel); border:1px solid var(--line); border-bottom-width:2px; border-radius:4px;
-        padding:1px 6px; color:#cbd5dd; font-size:11px; }
-  #status { color:var(--dim); font-size:12px; min-height:16px; }
+  button.ctrl { background:#fff; color:#000; border:1px solid #000; border-radius:9px;
+                padding:9px 16px; font:inherit; cursor:pointer; }
+  button.ctrl:hover { background:#000; color:#fff; }
+  .keys { color:#555; font-size:12px; text-align:center; }
+  kbd { background:#f2f2f2; border:1px solid #bbb; border-bottom-width:2px; border-radius:4px;
+        padding:1px 6px; color:#000; font-size:11px; }
 </style></head>
 <body>
-  <header>
-    <h1>MIRA-Mini &middot; live world model</h1>
-    <p class="sub">One side at a time &mdash; click Play to give it the whole H100. Our optimized inference vs the released baseline.</p>
-  </header>
-
   <div class="panels">
-    <div class="panel l-opt">
-      <div class="view opt">
+    <div class="panel">
+      <div class="view">
         <canvas id="cv-opt" width="640" height="360"></canvas>
-        <div class="live-tag" id="tag-opt">● LIVE</div>
-        <div class="overlay" id="ov-opt" data-which="opt"><button class="play">▶ Play now</button></div>
-      </div>
-      <div class="label opt"><span class="dot"></span>Ours <small>&mdash; 2-step PSD + torch.compile + CUDA graphs</small></div>
-      <div class="metrics">
-        <div class="metric"><div class="n" id="opt-fps">&ndash;</div><div class="u">gen fps</div></div>
-        <div class="metric"><div class="n" id="opt-ms">&ndash;</div><div class="u">ms / frame</div></div>
-        <div class="metric"><div class="n" id="opt-rt">&ndash;</div><div class="u">&times; realtime</div></div>
-        <div class="metric"><div class="n" id="opt-fpd">&ndash;</div><div class="u">frames / $</div></div>
+        <div class="overlay" id="ov-opt" data-which="opt"><button class="play">&#9654; Play &mdash; Ours (2-step)</button></div>
       </div>
     </div>
-    <div class="panel l-base">
-      <div class="view base">
+    <div class="panel">
+      <div class="view">
         <canvas id="cv-base" width="640" height="360"></canvas>
-        <div class="live-tag" id="tag-base">● LIVE</div>
-        <div class="overlay" id="ov-base" data-which="base"><button class="play">▶ Play now</button></div>
-      </div>
-      <div class="label base"><span class="dot"></span>Released <small>&mdash; 10-step base, eager</small></div>
-      <div class="metrics">
-        <div class="metric"><div class="n" id="base-fps">&ndash;</div><div class="u">gen fps</div></div>
-        <div class="metric"><div class="n" id="base-ms">&ndash;</div><div class="u">ms / frame</div></div>
-        <div class="metric"><div class="n" id="base-rt">&ndash;</div><div class="u">&times; realtime</div></div>
-        <div class="metric"><div class="n" id="base-fpd">&ndash;</div><div class="u">frames / $</div></div>
+        <div class="overlay" id="ov-base" data-which="base"><button class="play">&#9654; Play &mdash; Released (10-step)</button></div>
       </div>
     </div>
   </div>
-
-  <div class="summary" id="summary">warming up&hellip;</div>
+  <div class="summary" id="summary"></div>
   <div class="controls">
-    <button id="btn-reset">Reset world</button>
-    <button id="btn-seed">New scene</button>
+    <button class="ctrl" id="btn-reset">Reset world</button>
+    <button class="ctrl" id="btn-seed">New scene</button>
   </div>
   <div class="keys">
     <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive &middot; <kbd>Q</kbd><kbd>E</kbd> air-roll &middot;
     <kbd>Space</kbd> ball-cam &middot; <kbd>Shift</kbd> boost &middot; <kbd>Ctrl</kbd>
   </div>
-  <div id="status">connecting&hellip;</div>
-
 <script>
-// Key vocab order must match DEFAULT_RL_KEYS in mira/data/actions.py.
 const VOCAB = ["W","A","S","D","Q","E","Space","LShiftKey","LControlKey"];
 const CODE2KEY = {KeyW:"W",KeyA:"A",KeyS:"S",KeyD:"D",KeyQ:"Q",KeyE:"E",
                   Space:"Space",ShiftLeft:"LShiftKey",ShiftRight:"LShiftKey",
@@ -450,11 +400,9 @@ imgs.opt.onload  = () => ctx.opt.drawImage(imgs.opt, 0, 0, 640, 360);
 imgs.base.onload = () => ctx.base.drawImage(imgs.base, 0, 0, 640, 360);
 let running = true;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
 function keyIdxs(){ return [...held].map(k => VOCAB.indexOf(k)).filter(i => i>=0); }
 addEventListener("keydown", e => { const k=CODE2KEY[e.code]; if(k){ held.add(k); e.preventDefault(); }});
 addEventListener("keyup",   e => { const k=CODE2KEY[e.code]; if(k){ held.delete(k); e.preventDefault(); }});
-
 async function post(body){
   const r = await fetch("/step", {method:"POST", headers:{"Content-Type":"application/json"},
                                   body: JSON.stringify(body)});
@@ -464,47 +412,34 @@ const best = {opt:null, base:null};
 function updateSummary(){
   const o = best.opt, b = best.base;
   if(o && b){
-    $("summary").innerHTML = "Ours: <b class='hi'>" + (o.fps/b.fps).toFixed(1)
-      + "&times; more frames per second</b>, <b class='hi'>" + (o.fpd/b.fpd).toFixed(1)
-      + "&times; more frames per dollar</b> &mdash; " + o.steps + " diffusion steps vs " + b.steps + ".";
+    $("summary").innerHTML = "Ours: <b>" + (o.fps/b.fps).toFixed(1) + "&times; more frames / second</b> &middot; <b>"
+      + (o.fpd/b.fpd).toFixed(1) + "&times; more frames / dollar</b> &middot; " + o.steps + " steps vs " + b.steps;
   } else {
-    $("summary").innerHTML = "Play each side to compare &mdash; only one runs at a time so it gets the whole GPU.";
+    $("summary").textContent = "Play each side to compare — only one runs at a time so it gets the whole GPU.";
   }
 }
 function paint(which, m){
   imgs[which].src = "data:image/jpeg;base64," + m.frame;
-  $(which+"-fps").textContent = m.fps.toFixed(1);
-  $(which+"-ms").textContent  = m.ms.toFixed(1);
-  $(which+"-rt").textContent  = m.rt.toFixed(2) + "x";
-  $(which+"-fpd").textContent = m.fpd >= 1000 ? Math.round(m.fpd/1000) + "k" : m.fpd;
   best[which] = m;
   updateSummary();
 }
-// Only ONE side rolls out at a time -> it gets the whole GPU and stays reactive. Clicking a panel's
-// "Play now" makes it the active stream; the other freezes on its last frame with its button back.
 let active = null, loopId = 0;
 async function play(which){
-  const myId = ++loopId;         // bumping the token cancels any previous loop
+  const myId = ++loopId;
   active = which;
-  ["opt", "base"].forEach(w => {
-    $("ov-" + w).classList.toggle("hidden", w === which);   // hide the active panel's Play button
-    $("tag-" + w).classList.toggle("on", w === which);       // show its LIVE tag
-  });
-  $("status").textContent = (which === "opt" ? "OURS" : "RELEASED") + " is live — drive with WASD";
+  ["opt","base"].forEach(w => $("ov-"+w).classList.toggle("hidden", w===which));
   while(running && loopId === myId){
     try {
       const r = await post({which, keys: keyIdxs()});
       if(r && r[which] && r[which].frame) paint(which, r[which]);
-      else if(r && r.event === "error"){ $("status").textContent = "server error: " + r.detail; await sleep(800); }
-    } catch(e){ $("status").textContent = "reconnecting…"; await sleep(400); }
+      else await sleep(400);
+    } catch(e){ await sleep(400); }
   }
 }
-document.querySelectorAll(".overlay").forEach(ov =>
-  ov.onclick = () => play(ov.getAttribute("data-which")));
-$("btn-reset").onclick = () => { post({cmd:"reset"}); };
-$("btn-seed").onclick  = () => { post({cmd:"seed"}); };
+document.querySelectorAll(".overlay").forEach(ov => ov.onclick = () => play(ov.getAttribute("data-which")));
+$("btn-reset").onclick = () => post({cmd:"reset"});
+$("btn-seed").onclick  = () => post({cmd:"seed"});
 updateSummary();
-$("status").textContent = "click ▶ Play now on either side to start";
 </script>
 </body></html>
 """
