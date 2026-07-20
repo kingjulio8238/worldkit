@@ -79,11 +79,14 @@ data_vol = modal.Volume.from_name("mira-bench-data", create_if_missing=True)
 app = modal.App("mira-bench", image=image)
 
 
-def _run(cmd: list[str], nproc: int | None = None, visible: str | None = None) -> str:
+def _run(cmd: list[str], nproc: int | None = None, visible: str | None = None,
+         extra_env: dict | None = None) -> str:
     """Run a bench CLI as a subprocess in the scripts dir; optionally under torchrun for DDP."""
     import os
 
     env = os.environ.copy()
+    if extra_env:
+        env.update({k: v for k, v in extra_env.items() if v is not None})
     if visible is not None:
         env["CUDA_VISIBLE_DEVICES"] = visible
     if nproc and nproc > 1:
@@ -235,7 +238,7 @@ def qualitycheck(checkpoint: str, optims: str = "baseline,A1,A2,A4,A5", num_samp
            "--num-samples", str(num_samples), "--n-diffusion-steps", str(n_diffusion_steps)]
     if compile:
         cmd.append("--compile")
-    _run(cmd)
+    _run(cmd, extra_env={"RS_DINO_WEIGHTS_DIR": DINO_DIR})
 
 
 @app.function(gpu="H100", volumes={"/data": data_vol}, timeout=10800)
@@ -248,7 +251,9 @@ def qualitycheck_steps(checkpoint: str, n_diffusion_steps: str = "1 2 4 8 10", n
         cmd.append("--compile")
     if data_index:
         cmd += ["--data-index", data_index]
-    _run(cmd)
+    # Point the metric's DINOv3 at the staged weights (stage_dino). If absent, the DINO metrics are
+    # random-init but Inception-FID + latent-drift stay valid -- see docs/optimization_plan.md Phase 2.
+    _run(cmd, extra_env={"RS_DINO_WEIGHTS_DIR": DINO_DIR})
 
 
 # --------------------------------------------------------------------------- E2 asset staging
@@ -257,10 +262,18 @@ def qualitycheck_steps(checkpoint: str, n_diffusion_steps: str = "1 2 4 8 10", n
 # Where staged assets live on the volume. Phase 2 (`qualitycheck_steps`) reads these paths.
 CKPT_DIR = "/data/checkpoints"
 DATA_DIR = "/data/datasets/rocket-science"
+# The FDD *metric* builds its own DINOv3 backbone (separate from the codec's, which is restored from the
+# codec checkpoint). It reads RS_DINO_WEIGHTS_DIR; with no weights there it silently uses a RANDOM-init
+# DINO, making dino_frechet / dino_*_drift meaningless. Stage the real weights here for a valid gate.
+DINO_DIR = "/data/dino_weights"
 # Public model repos (no gate). PSD is the 2-step distilled variant the E2 plan adopts.
 MODEL_REPOS = {"mira-mini": "alakazamworld/mira-mini", "mira-mini-psd": "alakazamworld/mira-mini-psd"}
 # The eval dataset. Gated on the Hub (CC-BY-NC-SA) -> the HF_TOKEN secret must have accepted the terms.
 DATASET_REPO = "kyutai/rocket-science"
+# DINOv3 backbone the metric uses (model_size="base" -> vitb16). The .pth must be named exactly as the
+# repo's DINO_WEIGHT_FILENAMES expects so torch.hub.load(weights=...) finds it. Meta-gated on the Hub.
+DINO_METRIC_MODEL = "dinov3_vitb16"
+DINO_HF_REPO = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
 
 def _hf_snapshot(repo_id, local_dir, repo_type="model", allow_patterns=None):
@@ -337,6 +350,41 @@ def verify_assets(dataset_split: str = "test") -> None:
         print(f"  {split_dir}: index.json OK, {loaded.total_samples} samples", flush=True)
     else:
         print(f"  {split_dir}: MISSING index.json", flush=True)
+
+
+@app.function(volumes={"/data": data_vol}, timeout=3600, secrets=[modal.Secret.from_name("huggingface")])
+def stage_dino(hf_repo: str = DINO_HF_REPO) -> None:
+    """Stage the DINOv3 metric weights onto the volume at DINO_DIR (Phase 2 prerequisite).
+
+    Best-effort: snapshot the (Meta-gated) DINOv3 repo, then ensure a .pth exists under the exact
+    filename torch.hub expects (DINO_WEIGHT_FILENAMES). If the repo only ships safetensors, this logs
+    what it found so you can supply the .pth manually. Without valid weights the DINO metrics are
+    random-init; Inception-FID + latent-drift stay valid (see docs).
+    """
+    import glob
+    import os
+    import shutil
+
+    from mira.codec.dino import DINO_WEIGHT_FILENAMES
+
+    target_name = DINO_WEIGHT_FILENAMES[DINO_METRIC_MODEL]
+    os.makedirs(DINO_DIR, exist_ok=True)
+    print(f"===== DINOv3 {hf_repo} -> {DINO_DIR} (target {target_name}) =====", flush=True)
+    local = _hf_snapshot(hf_repo, DINO_DIR, repo_type="model")
+
+    target = os.path.join(DINO_DIR, target_name)
+    if not os.path.exists(target):
+        pths = [p for p in glob.glob(f"{local}/**/*.pth", recursive=True) if os.path.basename(p) != target_name]
+        if pths:
+            shutil.copy(pths[0], target)
+            print(f"  copied {os.path.basename(pths[0])} -> {target_name}", flush=True)
+        else:
+            others = sorted(os.path.basename(p) for p in glob.glob(f"{local}/**/*", recursive=True) if os.path.isfile(p))
+            print(f"  NO .pth found. Repo files: {others}\n"
+                  f"  torch.hub needs a .pth state dict named {target_name}; if only safetensors are\n"
+                  f"  present, convert/rename one to that path on the volume.", flush=True)
+    print(f"  RS_DINO_WEIGHTS_DIR ready: {os.path.exists(target)} ({target})", flush=True)
+    data_vol.commit()
 
 
 @app.function(gpu="H100", volumes={"/data": data_vol}, timeout=7200)

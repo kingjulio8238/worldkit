@@ -389,16 +389,26 @@ Chosen: **Tier B.** The `tau_delta` is derived from the already-static `delta_ts
 `_denoise_frame_body`, so the fix is to drop the conservative PSD guard (no new static buffer needed).
 - **Exit:** guard removed; `--psd` bench flag exercises the PSD inference path on random init.
 
-## Phase 1 — Stage assets on the volume  *(no paid GPU)*
-Dataset is **available (not gated)** for us. Download onto the `mira-bench-data` volume:
-- `alakazamworld/mira-mini` (base, `checkpoint-52000`) + `alakazamworld/mira-mini-psd` (2-step) — public HF.
-- rocket-science test split + a clip index (for the quality metrics loader).
-- DINOv3 backbone *weights* (the image bakes the *code* only).
-- **Exit:** `qualitycheck_steps` can `load_world_model` both checkpoints and `_build_loader` yields batches.
+## Phase 1 — Stage assets on the volume  *(no paid GPU)* — ✅ DONE (2026-07-20)
+`modal run scripts/modal_bench.py::stage_assets` downloaded onto the `mira-bench-data` volume; verified
+by `::verify_assets`:
+- base: `/data/checkpoints/mira-mini/checkpoint-52000/checkpoint.pth` (+ bundled `codec/checkpoint-125000/`).
+- PSD: `/data/checkpoints/mira-mini-psd/checkpoint-10000/checkpoint.pth` (+ bundled codec).
+- dataset: `/data/datasets/rocket-science/test` — `index.json` OK, **62 samples**.
+
+Two follow-ups this surfaced:
+- **DINOv3 metric weights (Phase 2 prerequisite).** The FDD *metric* builds its own DINOv3 backbone
+  (separate from the codec's, which is restored from the codec checkpoint). It reads
+  `RS_DINO_WEIGHTS_DIR`; with nothing there it **silently uses a random-init DINO**, making
+  `dino_frechet` / `dino_*_drift` meaningless. `stage_dino` stages the Meta-gated `dinov3_vitb16`
+  weights to `/data/dino_weights`, and both quality functions now export `RS_DINO_WEIGHTS_DIR` to it.
+  **Inception-FID + latent-drift + LPIPS/PSNR/SSIM need no DINO weights and stay valid** as a fallback.
+- **62-sample test split** is small for Frechet stats — treat the curve as *relative* (base-vs-PSD,
+  steps-vs-steps), and cap `--num-samples` at ~62 so the loader isn't asked for more clips than exist.
 
 ## Phase 2 — Quality gate (the proof)  *(paid GPU, ~1–2 H100-hr)*
-Run `qualitycheck_steps` on base and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of
-10-step quality).
+Optionally `modal run ...::stage_dino` first (valid DINO metrics). Then run `qualitycheck_steps` on base
+and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of 10-step quality).
 - **Expect:** base min-viable ≈ 4–6; **PSD min-viable = 1–2.** That green-lights 2 steps.
 
 ## Phase 3 — PSD graph wiring + correctness  *(Tier B code, done in Phase 0; verify here)*
@@ -416,13 +426,15 @@ Run `qualitycheck_steps` on base and PSD over `1 2 4 8 10` steps; report min-via
 - Document the 10-step-eager-base → 2-step-PSD-full-stack = ~7× result; commit + push to worldkit.
 
 ## Status / critical path
-| phase | effort | GPU $ | blocker |
+| phase | status | GPU $ | blocker |
 |---|---|---|---|
-| 0 Tier B graphs | ~15 lines | none | — (done in code) |
-| 1 stage assets | low | none | — (dataset available) |
-| 2 quality gate | low | ~1–2 hr | PSD needing >2 steps (paper says no) |
-| 3 PSD graph verify | done | minutes | low |
-| 4 speed confirm | trivial | minutes | low (speed already measured) |
-| 5 defaults + docs | low | none | — |
+| 0 Tier B graphs | ✅ code done | none | — |
+| 1 stage assets | ✅ staged + verified | none | — |
+| 2 quality gate | ⏳ awaits run | ~1–2 hr | DINOv3 metric weights (`stage_dino`); else FID/latent-drift only |
+| 3 PSD graph verify | ⏳ awaits run | minutes | none (random-init, no deps) |
+| 4 speed confirm | ⏳ awaits run | minutes | none (speed already measured) |
+| 5 defaults + docs | pending | none | gated on Phase 2 result |
 
-**Progress:** Phase 0 + Phase 1 (harness) implemented; Phases 2/4 await the paid `modal run`.
+**Progress:** Phase 0 (Tier B PSD graphs) + Phase 1 (assets staged + verified on the volume) done.
+Phase 3 (`infer --compile --cuda-graphs --psd --verify-graphs`, bit-exact) and Phase 4 (2-step speed)
+are runnable now with no further deps; Phase 2 additionally wants `stage_dino` for valid DINO metrics.
