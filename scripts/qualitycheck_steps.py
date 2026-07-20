@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compile", action="store_true")
     p.add_argument("--data-index", default=None,
                    help="override the checkpoint config's dataset.test_index (e.g. the rocket-science test split)")
+    p.add_argument("--exclude-metric-substr", nargs="*", default=[],
+                   help="drop scalar-metric keys containing any of these substrings from the MIN-VIABLE "
+                        "decision (the metrics still run). Pass 'dino fdd' when the DINOv3 metric weights "
+                        "are unavailable (gated) -- the DINO metrics are then random-init noise; the "
+                        "decision falls back to latent_drift + lpips + fid_at_* (Inception, DINO-free).")
     return p.parse_args()
 
 
@@ -92,8 +97,14 @@ def main() -> None:
     # Reference = the most steps (best quality). Find the fewest steps within QUALITY_TOLERANCE.
     ref_steps = steps_sorted[-1]
     ref = results[ref_steps]
-    metric_keys = [k for k in ref if any(h in k.lower() for h in LOWER_IS_BETTER_HINTS) and ref[k]]
+    excl = [s.lower() for s in args.exclude_metric_substr]
+    candidate = [k for k in ref if any(h in k.lower() for h in LOWER_IS_BETTER_HINTS) and ref[k]]
+    metric_keys = [k for k in candidate if not any(e in k.lower() for e in excl)]
     print(f"\n===== quality-vs-steps report (reference = {ref_steps} steps) =====")
+    if excl:
+        dropped = [k for k in candidate if any(e in k.lower() for e in excl)]
+        print(f"  excluded from decision ({', '.join(excl)}): {dropped}")
+    print(f"  min-viable decided on: {metric_keys}")
     min_viable = ref_steps
     for n_steps in steps_sorted:
         deltas = {k: (results[n_steps][k] - ref[k]) / abs(ref[k]) for k in metric_keys}

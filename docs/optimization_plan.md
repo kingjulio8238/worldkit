@@ -408,9 +408,14 @@ Two follow-ups this surfaced:
   steps-vs-steps), and cap `--num-samples` at ~62 so the loader isn't asked for more clips than exist.
 
 ## Phase 2 — Quality gate (the proof)  *(paid GPU, ~1–2 H100-hr)*
-Optionally `modal run ...::stage_dino` first (valid DINO metrics). Then run `qualitycheck_steps` on base
-and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of 10-step quality).
+Run `qualitycheck_steps` on base and PSD over `1 2 4 8 10` steps; report min-viable steps (within 5% of
+10-step quality).
 - **Expect:** base min-viable ≈ 4–6; **PSD min-viable = 1–2.** That green-lights 2 steps.
+- **DINOv3 metric weights are Meta-gated and our HF token is NOT authorized** (`stage_dino` → 403
+  GatedRepoError; it now exits gracefully). So the DINO metrics run random-init and are excluded: the
+  Modal `qualitycheck_steps` auto-passes `--exclude-metric-substr dino fdd`, and the min-viable decision
+  falls back to **`latent_drift_20` + `lpips` + `fid_at_*` (Inception, DINO-free)** — a valid quality
+  signal for the base-vs-PSD comparison. (Request access at the DINOv3 HF page to restore DINO metrics.)
 
 ## Phase 3 — PSD graph wiring + correctness  *(Tier B code, done in Phase 0; verify here)*
 - `bench_infer_speed --compile --cuda-graphs --psd --verify-graphs` → **maxdiff 0.0** (PSD graphed ==

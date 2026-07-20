@@ -243,16 +243,36 @@ def qualitycheck(checkpoint: str, optims: str = "baseline,A1,A2,A4,A5", num_samp
 
 @app.function(gpu="H100", volumes={"/data": data_vol}, timeout=10800)
 def qualitycheck_steps(checkpoint: str, n_diffusion_steps: str = "1 2 4 8 10", num_samples: int = 256,
-                       schedule_type: str = "linear_quadratic", compile: bool = False, data_index: str = "") -> None:
-    """E2 quality-vs-steps: FDD/drift at each diffusion-step count on a REAL checkpoint (on the volume)."""
+                       schedule_type: str = "linear_quadratic", compile: bool = False, data_index: str = "",
+                       exclude_metric_substr: str = "auto") -> None:
+    """E2 quality-vs-steps: FDD/drift at each diffusion-step count on a REAL checkpoint (on the volume).
+
+    ``exclude_metric_substr`` keys are dropped from the MIN-VIABLE decision (metrics still run). Default
+    "auto": if the DINOv3 metric weights aren't staged (stage_dino / gated), the DINO metrics are
+    random-init noise, so auto-exclude 'dino fdd' and decide on latent_drift + lpips + fid_at_* (valid).
+    """
+    import os
+
+    from mira.codec.dino import DINO_WEIGHT_FILENAMES
+
+    dino_ok = os.path.exists(os.path.join(DINO_DIR, DINO_WEIGHT_FILENAMES[DINO_METRIC_MODEL]))
+    if exclude_metric_substr == "auto":
+        excl = [] if dino_ok else ["dino", "fdd"]
+    else:
+        excl = exclude_metric_substr.split()
+    if not dino_ok:
+        print("NOTE: DINOv3 metric weights absent -> DINO metrics are random-init; min-viable decided on "
+              "latent_drift + lpips + fid_at_* (Inception, DINO-free).", flush=True)
+
     cmd = ["qualitycheck_steps.py", checkpoint, "--n-diffusion-steps", *n_diffusion_steps.split(),
            "--num-samples", str(num_samples), "--schedule-type", schedule_type]
     if compile:
         cmd.append("--compile")
     if data_index:
         cmd += ["--data-index", data_index]
-    # Point the metric's DINOv3 at the staged weights (stage_dino). If absent, the DINO metrics are
-    # random-init but Inception-FID + latent-drift stay valid -- see docs/optimization_plan.md Phase 2.
+    if excl:
+        cmd += ["--exclude-metric-substr", *excl]
+    # RS_DINO_WEIGHTS_DIR is still exported (harmless if empty; used when weights are staged).
     _run(cmd, extra_env={"RS_DINO_WEIGHTS_DIR": DINO_DIR})
 
 
@@ -370,7 +390,15 @@ def stage_dino(hf_repo: str = DINO_HF_REPO) -> None:
     target_name = DINO_WEIGHT_FILENAMES[DINO_METRIC_MODEL]
     os.makedirs(DINO_DIR, exist_ok=True)
     print(f"===== DINOv3 {hf_repo} -> {DINO_DIR} (target {target_name}) =====", flush=True)
-    local = _hf_snapshot(hf_repo, DINO_DIR, repo_type="model")
+    try:
+        local = _hf_snapshot(hf_repo, DINO_DIR, repo_type="model")
+    except Exception as exc:  # noqa: BLE001 -- gated/unauthorized/offline: don't crash the app
+        print(f"  could not download ({type(exc).__name__}: {exc}).\n"
+              f"  DINOv3 is Meta-gated -- request access at https://huggingface.co/{hf_repo} and make\n"
+              f"  sure the HF_TOKEN secret's account is authorized, then re-run. Proceeding WITHOUT DINO\n"
+              f"  metric weights is fine: qualitycheck_steps auto-excludes the DINO metrics and decides\n"
+              f"  on latent_drift + lpips + fid_at_* (Inception, DINO-free).", flush=True)
+        return
 
     target = os.path.join(DINO_DIR, target_name)
     if not os.path.exists(target):
