@@ -7,6 +7,10 @@ rocket-science clip, and streams actual generated frames as you press keys. The 
 measured on the GPU per frame (torch.cuda.Event), not scripted. Transport is HTTP polling (one POST
 per frame) — robust on Modal's runtime; the per-frame GPU time is what the HUD reports.
 
+This is now a thin **reference client over MiraEngine** (the sibling mira-engine package): the demo only
+calls `set_context` / `gen_frame` / `render`; the engine owns model loading, the fast stack, and the
+streaming state — mirroring how world_engine's examples drive `WorldEngine`.
+
     modal serve scripts/live_demo.py     # dev: prints a *.modal.run URL, open it, drive with WASD
     modal deploy scripts/live_demo.py    # persistent URL (run `modal app stop mira-live-demo` when done)
 
@@ -56,6 +60,10 @@ image = (
                            "**/.benchmarks"])
     .run_commands(f"pip install -e '{REMOTE_REPO}[train]'")
     .pip_install("fastapi", "uvicorn[standard]")
+    # The MiraEngine package (sibling repo) -- the demo is now a thin reference client over it.
+    .add_local_dir(str(REPO_ROOT.parent / "mira-engine"), "/root/mira-engine", copy=True,
+                   ignore=["**/.git", "**/__pycache__", "**/*.mp4", "**/*.egg-info"])
+    .run_commands("pip install -e /root/mira-engine --no-deps")
     .run_function(_prefetch_dino)
 )
 
@@ -63,153 +71,33 @@ data_vol = modal.Volume.from_name("mira-bench-data", create_if_missing=True)
 app = modal.App("mira-live-demo", image=image)
 
 
-# --------------------------------------------------------------------------- inference session
+# --------------------------------------------------------------------------- engines (reference client)
 
 
-class LiveSession:
-    """One interactive rollout: bootstraps from a real clip, then steps frame-by-frame on live actions.
+def _load_engines(device):
+    """Build the optimized (2-step PSD) + baseline (10-step base) MiraEngine instances + seed clips.
 
-    Holds the sliding latent window + streaming KV-cache + (optional) CUDA-graph runner + action
-    history for the currently selected mode. `step(keys)` denoises one latent, decodes it, and returns
-    the newest video frame(s) plus the measured GPU time.
+    The demo is a thin client over MiraEngine -- the engine owns model loading, the fast stack, and the
+    streaming state; the demo just calls set_context / gen_frame / render.
     """
-
-    def __init__(self, models: dict, seed_batches: list, device, mode: str = "optimized"):
-        import torch  # noqa: PLC0415
-
-        self.torch = torch
-        self.models = models          # {"optimized": (model, cfg), "baseline": (model, cfg)}
-        self.seed_batches = seed_batches
-        self.device = device
-        self.seed_idx = 0
-        self.set_mode(mode)
-
-    def set_mode(self, mode: str) -> None:
-        """Switch optimized/baseline and re-bootstrap the world from the current seed clip."""
-        if mode not in self.models:
-            mode = "optimized"
-        self.mode = mode
-        self.model, self.cfg = self.models[mode]
-        self.reset()
-
-    def reset(self) -> None:
-        torch = self.torch
-        model = self.model
-        seed = self.seed_batches[self.seed_idx % len(self.seed_batches)]
-        self.window = model.n_context_latents + 1
-        self.td = model.temporal_downsampling
-        z_full = model.init_streaming_inference(seed.clone())
-        # Start from the last `window` latents so the streaming state matches the trained window size.
-        self.z = z_full[:, -self.window:].contiguous()
-        self.kv = None
-        # Action history: the seed's actions (aligned to the context frames). We append live actions.
-        self.actions = seed.actions.clone().to(self.device)
-        self.n_keys = self.actions.key_presses.shape[-1]
-        self.graph_runner = self._make_graph_runner()
-        self.frame_idx = 0
-
-    def next_seed(self) -> None:
-        self.seed_idx += 1
-        self.reset()
-
-    def _make_graph_runner(self):
-        """Build a FrameGraphRunner for the optimized path (cuda_graphs on); None otherwise."""
-        if not self.cfg.cuda_graphs:
-            return None
-        from mira.inference.cuda_graphs import FrameGraphRunner  # noqa: PLC0415
-
-        return FrameGraphRunner(self.model, self.cfg.n_diffusion_steps, self.cfg.noise_level,
-                                self.cfg.schedule_type)
-
-    def _append_action(self, keys: list[int]) -> None:
-        """Append the currently-held multi-hot key vector for this step's `td` video frames."""
-        torch = self.torch
-        vec = torch.zeros(self.n_keys, dtype=torch.int32, device=self.device)
-        for k in keys:
-            if 0 <= k < self.n_keys:
-                vec[k] = 1
-        # td actions per latent frame (the player holds one control across the chunk).
-        new = self.actions.slice_time(0, 0)  # empty clone with same config/batch/device
-        new.key_presses = vec.view(1, 1, self.n_keys).repeat(1, self.td, 1)
-        # Rocket-science is keyboard-only; keep mouse zeros but time-aligned so cat_time/n_steps agree.
-        new.mouse_movements = torch.zeros((1, self.td, 2), dtype=torch.float32, device=self.device)
-        self.actions = self.actions.cat_time(new)
-
-    def step(self, keys: list[int]):
-        """Denoise one latent from the held keys, decode it, and return (uint8 HWC frame, denoise_ms).
-
-        `denoise_ms` times ONLY the diffusion (streaming_inference_step) -- the thing we optimized
-        (2-step vs 10-step) and the honest Ours-vs-Released number; decode is a shared constant cost.
-        """
-        torch = self.torch
-        self._append_action(keys)
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        with torch.no_grad():
-            start.record()
-            self.z, self.kv = self.model.streaming_inference_step(
-                self.z, self.actions, streaming_kv_cache=self.kv, config=self.cfg,
-                graph_runner=self.graph_runner, ring_cache=self.cfg.cuda_graphs,
-            )
-            end.record()
-            torch.cuda.synchronize()
-            denoise_ms = start.elapsed_time(end)
-            # Decode a short trailing window: the temporally-downsampled codec needs neighbouring
-            # latents for a valid frame -- decoding a single latent in isolation renders black.
-            dw = min(4, self.z.shape[1])
-            video = self.model.decode_to_video(self.z[:, -dw:])  # (1, dw*td, C, H, W) in [-1, 1]
-
-        vid = ((video[0, -1].clamp(-1, 1) * 0.5 + 0.5) * 255).to(torch.uint8)  # (C, H, W)
-        frame = vid.permute(1, 2, 0).contiguous().cpu().numpy()                # (H, W, C)
-        if self.frame_idx < 3:  # diagnostic: confirm the decode carries signal (not all-zero/black)
-            print(f"[{self.mode} f{self.frame_idx}] denoise {denoise_ms:.1f}ms  decoded "
-                  f"min/max/mean={video.min():.2f}/{video.max():.2f}/{video.mean():.2f}  "
-                  f"frame={tuple(frame.shape)}", flush=True)
-        self.frame_idx += 1
-        # Trim the action history so it can't grow unbounded over a long session.
-        keep = (self.window + 2) * self.td
-        if self.actions.key_presses.shape[1] > keep:
-            self.actions = self.actions.slice_time(-keep, None)
-        return frame, denoise_ms
-
-
-# --------------------------------------------------------------------------- model loading
-
-
-def _load_models(device):
-    """Load the PSD (optimized) and base (baseline) checkpoints + build a few real seed clips."""
-    import glob
     import sys
 
-    import torch  # noqa: PLC0415
+    from mira_engine import MiraEngine  # noqa: PLC0415
 
+    opt = MiraEngine(PSD_CKPT, device=device, n_diffusion_steps=2, schedule_type="linear_quadratic",
+                     noise_level=0.2, compile=True, cuda_graphs=True)
+    base = MiraEngine(BASE_CKPT, device=device, n_diffusion_steps=10, schedule_type="linear_quadratic",
+                      noise_level=0.2, compile=True, cuda_graphs=False)
+
+    # Seed clips from the real test split, reusing the (already-loaded) optimized engine's model.
     sys.path.insert(0, f"{REMOTE_REPO}/scripts")
     from eval_world_model_offline import _build_loader, load_run_config  # noqa: PLC0415
 
-    from mira.inference.loading import load_world_model  # noqa: PLC0415
-    from mira.world_model.config import WorldModelInferenceConfig  # noqa: PLC0415
-
-    def _local_codec(ckpt: str):
-        hits = sorted(glob.glob(f"{Path(ckpt).parents[1]}/codec/**/checkpoint.pth", recursive=True))
-        return hits[0] if hits else None
-
-    opt_model, _ = load_world_model(Path(PSD_CKPT), device=device, codec_checkpoint=_local_codec(PSD_CKPT))
-    base_model, _ = load_world_model(Path(BASE_CKPT), device=device, codec_checkpoint=_local_codec(BASE_CKPT))
-    opt_model.eval()
-    base_model.eval()
-    opt_model.world_model.compile()
-    opt_model.decode_to_video = torch.compile(opt_model.decode_to_video)
-
-    opt_cfg = WorldModelInferenceConfig(n_diffusion_steps=2, schedule_type="linear_quadratic",
-                                        noise_level=0.2, streaming_cache="ring", cuda_graphs=True)
-    base_cfg = WorldModelInferenceConfig(n_diffusion_steps=10, schedule_type="linear_quadratic",
-                                         noise_level=0.2, streaming_cache="grow", cuda_graphs=False)
-
     cfg = load_run_config(Path(PSD_CKPT))
     cfg.dataset.test_index = DATA_INDEX
-    clip_len = (opt_model.n_context_latents + 2) * opt_model.temporal_downsampling
-    loader = _build_loader(cfg, opt_model, clip_len=clip_len, batch_size=1, seed=7)
+    m = opt.model
+    clip_len = (m.n_context_latents + 2) * m.temporal_downsampling
+    loader = _build_loader(cfg, m, clip_len=clip_len, batch_size=1, seed=7)
     it = iter(loader)
     seeds = []
     for _ in range(4):
@@ -218,15 +106,15 @@ def _load_models(device):
             seeds.append(item[0] if isinstance(item, (tuple, list)) else item)
         except StopIteration:
             break
-
-    models = {"optimized": (opt_model, opt_cfg), "baseline": (base_model, base_cfg)}
-    return models, seeds
+    return {"optimized": opt, "baseline": base}, seeds
 
 
 # --------------------------------------------------------------------------- ASGI app
 
-OPT_SESSION = None   # optimized (2-step PSD + graphs)
-BASE_SESSION = None  # released baseline (10-step, eager)
+OPT_ENGINE = None    # MiraEngine: optimized (2-step PSD + graphs)
+BASE_ENGINE = None   # MiraEngine: released baseline (10-step, eager)
+SEEDS: list = []
+SEED_IDX = 0
 
 
 @app.function(gpu="H100", volumes={"/data": data_vol}, timeout=3600,
@@ -242,32 +130,30 @@ def web():
     import torch
     from fastapi import FastAPI, Request
     from fastapi.responses import HTMLResponse, JSONResponse
+    from mira_engine import CtrlInput
     from PIL import Image
     from starlette.concurrency import run_in_threadpool
 
     device = torch.device("cuda")
     print("Loading models (this warms both checkpoints)...", flush=True)
-    models, seeds = _load_models(device)
+    engines, seeds = _load_engines(device)
 
-    global OPT_SESSION, BASE_SESSION
-    # Two sessions from the SAME seed clip: same keystrokes drive both, so it's the same scene, ours vs
-    # released, side by side. (They're stepped sequentially per request -> the shared CUDA-graph buffers
-    # are never used concurrently.)
-    OPT_SESSION = LiveSession(models, seeds, device, mode="optimized")
-    BASE_SESSION = LiveSession(models, seeds, device, mode="baseline")
-    # Warm at startup so the first interaction is snappy (optimized compile + graph capture). Any bug in
-    # step()/decode surfaces HERE, before the URL goes live -- read the logs above "Ready.".
+    global OPT_ENGINE, BASE_ENGINE, SEEDS, SEED_IDX
+    OPT_ENGINE, BASE_ENGINE, SEEDS, SEED_IDX = engines["optimized"], engines["baseline"], seeds, 0
+    # Same seed clip -> same scene, ours vs released. set_context bootstraps each engine's world.
+    OPT_ENGINE.set_context(SEEDS[0])
+    BASE_ENGINE.set_context(SEEDS[0])
     print("Warming (torch.compile + CUDA-graph capture, ~1-2 min)...", flush=True)
     for _ in range(2):
-        OPT_SESSION.step([])
-    BASE_SESSION.step([])
+        OPT_ENGINE.gen_frame(CtrlInput(), return_img=False); OPT_ENGINE.render()
+    BASE_ENGINE.gen_frame(CtrlInput(), return_img=False); BASE_ENGINE.render()
+    OPT_ENGINE.set_context(SEEDS[0]); BASE_ENGINE.set_context(SEEDS[0])  # fresh start after warmup
     print("Ready. URL is live; drive with WASD.", flush=True)
 
     fapp = FastAPI()
 
     @fapp.exception_handler(Exception)
     async def _on_error(request: Request, exc: Exception):
-        # Only fires on an unhandled error -> log it and return a clean JSON the client can show.
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"event": "error", "detail": str(exc)})
 
@@ -277,42 +163,49 @@ def web():
 
     @fapp.get("/ping")
     def ping():
-        return JSONResponse({"ok": True, "ready": OPT_SESSION is not None})
+        return JSONResponse({"ok": True, "ready": OPT_ENGINE is not None})
 
-    def _panel(session, keys: list[int]) -> dict:
-        frame, ms = session.step(keys)
+    def _panel(engine, keys: list[int]) -> dict:
+        # Time the diffusion only (the thing we optimized: 2-step vs 10-step); decode separately for
+        # display, so the Ours-vs-Released number isn't diluted by the shared, constant codec cost.
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        engine.gen_frame(CtrlInput(button=set(keys)), return_img=False)
+        end.record()
+        torch.cuda.synchronize()
+        ms = max(start.elapsed_time(end), 0.1)
+        img = engine.render()[-1]  # (H, W, 3) uint8, newest frame
         buf = io.BytesIO()
-        Image.fromarray(frame).save(buf, format="JPEG", quality=90)  # native res, high quality (sharper)
-        ms = max(float(ms), 0.1)   # guard a 0 that would make fps non-finite (invalid JSON)
-        fps = 1000.0 / ms * session.td
+        Image.fromarray(img.cpu().numpy()).save(buf, format="JPEG", quality=90)
+        fps = 1000.0 / ms * engine._td
         return {
             "frame": base64.b64encode(buf.getvalue()).decode(),
             "ms": round(ms, 1), "fps": round(fps, 1),
-            "rt": round(fps / float(session.model.config.video.fps), 2),
+            "rt": round(fps / float(engine.model.config.video.fps), 2),
             "fpd": int(fps * 3600.0 / H100_USD_PER_HR),
-            "steps": int(session.cfg.n_diffusion_steps),
+            "steps": int(engine.n_diffusion_steps),
         }
 
     def _process(body: dict) -> dict:
         """All the (blocking) GPU work; run in a threadpool so the event loop stays free."""
+        global SEED_IDX
         try:
             cmd = body.get("cmd")
             if cmd == "reset":
-                OPT_SESSION.reset(); BASE_SESSION.reset()
+                OPT_ENGINE.set_context(SEEDS[SEED_IDX]); BASE_ENGINE.set_context(SEEDS[SEED_IDX])
                 return {"event": "reset"}
             if cmd == "seed":
-                OPT_SESSION.next_seed(); BASE_SESSION.next_seed()
-                return {"event": "seed", "idx": OPT_SESSION.seed_idx}
+                SEED_IDX = (SEED_IDX + 1) % len(SEEDS)
+                OPT_ENGINE.set_context(SEEDS[SEED_IDX]); BASE_ENGINE.set_context(SEEDS[SEED_IDX])
+                return {"event": "seed", "idx": SEED_IDX}
             keys = body.get("keys", [])
-            # Same keys drive both -> same scene, diverging only by model + step count. `which` lets the
-            # client poll each panel on its own loop (OURS flat-out, RELEASED throttled) so OURS stays
-            # reactive instead of both being bottlenecked by the baseline's ~200ms step.
-            which = body.get("which")
+            which = body.get("which")  # client polls each panel on its own loop (one at a time)
             if which == "opt":
-                return {"opt": _panel(OPT_SESSION, keys)}
+                return {"opt": _panel(OPT_ENGINE, keys)}
             if which == "base":
-                return {"base": _panel(BASE_SESSION, keys)}
-            return {"opt": _panel(OPT_SESSION, keys), "base": _panel(BASE_SESSION, keys)}
+                return {"base": _panel(BASE_ENGINE, keys)}
+            return {"opt": _panel(OPT_ENGINE, keys), "base": _panel(BASE_ENGINE, keys)}
         except Exception as exc:  # noqa: BLE001 -- surface errors to the client instead of a blank frame
             traceback.print_exc()
             return {"event": "error", "detail": f"{type(exc).__name__}: {exc}"}
