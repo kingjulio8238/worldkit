@@ -503,3 +503,26 @@ per frame exceed the hidden dim (roughly p≥8 at MIRA's latent sizes), which th
 forward), and multiplayer is compute-bound (unlike launch-bound single-player), so the shelved
 compute-bound optims (int8/fp8, tier C) start paying off here. tile_local is the architectural lever
 that turns "4 players" into "scales with players".
+
+## Measured result (H100, random-init, 4 steps eager) — the crossover is at ~16 players
+`bench_multiplayer.py`, per-frame denoise latency (ms):
+
+| p | tokens/frame | global | tile_local | global marginal |
+|---|---|---|---|---|
+| 1 | 144 | 167 | 158 | — |
+| 2 | 288 | 214 | 245 | 1.3× |
+| 4 | 576 | 338 | 370 | 1.6× |
+| 8 | 1152 | 652 | 676 | 1.9× |
+| 16 | 2304 | 1561 | 1548 | **2.4×** |
+
+**Conclusion: for MIRA-Mini's geometry (144 tok/player vs hidden 2048), spatial attention is NOT the
+multiplayer bottleneck in the realistic range.** Global scales ~linearly (projection/MLP-bound) up to
+p≈8; the O(p²) term only overtakes projections at tokens > hidden (~p=14), where global goes superlinear
+(2.4× for 2× players, 8→16) and tile_local **first crosses over to faster** (1548 vs 1561 at p=16). So:
+- **p ≤ 8 (2v2…4v4): linear-bound.** tile_local's cross-player mixer is a small net tax; don't use it.
+  The win here is the player-count-independent PSD/compile/graphs stack (4-player 338→~65ms ≈ 15fps).
+- **p ≥ 16: attention-bound.** tile_local starts paying off and widens beyond — a many-player feature.
+- **The real ≤16-player levers are memory + linear cost** → int8/fp8 (the compute-bound regime where
+  tier-C finally wins) + PSD (fewer passes = less compute AND peak memory).
+
+`spatial_attention="tile_local"` stays a validated, default-off flag for the >16-player regime.
