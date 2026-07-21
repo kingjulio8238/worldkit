@@ -78,6 +78,14 @@ image = (
     .run_function(_prefetch_dino)
 )
 
+# Phase 44: the sibling MiraEngine repo layered onto the bench image (which already has mira + torch +
+# torchao), installed editable --no-deps, so we can verify the engine end to end on the staged checkpoint.
+MIRA_ENGINE_DIR = REPO_ROOT.parent / "mira-engine"
+engine_image = image.add_local_dir(
+    str(MIRA_ENGINE_DIR), "/root/mira-engine", copy=True,
+    ignore=["**/.git", "**/__pycache__", "**/*.mp4", "**/*.egg-info"],
+).run_commands("pip install -e /root/mira-engine --no-deps")
+
 data_vol = modal.Volume.from_name("mira-bench-data", create_if_missing=True)
 
 app = modal.App("mira-bench", image=image)
@@ -158,6 +166,20 @@ def multiplayer(n_players: str = "1 2 4 8 16", modes: str = "global tile_local",
     if tf32:
         cmd.append("--tf32")
     _run(cmd)
+
+
+@app.function(gpu="H100", image=engine_image, volumes={"/data": data_vol}, timeout=3600)
+def engine_verify(model: str = "/data/checkpoints/mira-mini-psd/checkpoint-10000/checkpoint.pth",
+                  data_index: str = "/data/datasets/rocket-science/test",
+                  n_frames: int = 6, n_diffusion_steps: int = 4) -> None:
+    """Phase 44: MiraEngine graph-vs-eager bit-exactness + determinism + decode sanity on a real ckpt."""
+    cmd = ["python", "/root/mira-engine/examples/verify.py", "--model", model,
+           "--data-index", data_index, "--n-frames", str(n_frames),
+           "--n-diffusion-steps", str(n_diffusion_steps)]
+    print("$ " + " ".join(cmd), flush=True)
+    proc = subprocess.run(cmd, cwd="/root/mira-engine", text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"engine verify failed ({proc.returncode})")
 
 
 # --------------------------------------------------------------------------- training
