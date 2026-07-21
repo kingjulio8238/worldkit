@@ -182,6 +182,20 @@ def engine_verify(model: str = "/data/checkpoints/mira-mini-psd/checkpoint-10000
         raise RuntimeError(f"engine verify failed ({proc.returncode})")
 
 
+@app.function(gpu="H100", image=engine_image, volumes={"/data": data_vol}, timeout=7200)
+def engine_bench(model: str = "/data/checkpoints/mira-mini-psd/checkpoint-10000/checkpoint.pth",
+                 data_index: str = "/data/datasets/rocket-science/test", steps: int = 2,
+                 quant: str = "none intw8a8 fp8w8a8", n_frames: int = 48, warmup: int = 8) -> None:
+    """Phase 45: MiraEngine streaming latency + memory + decode sanity across quant modes."""
+    cmd = ["python", "/root/mira-engine/examples/benchmark.py", "--model", model,
+           "--data-index", data_index, "--steps", str(steps), "--quant", *quant.split(),
+           "--n-frames", str(n_frames), "--warmup", str(warmup)]
+    print("$ " + " ".join(cmd), flush=True)
+    proc = subprocess.run(cmd, cwd="/root/mira-engine", text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"engine bench failed ({proc.returncode})")
+
+
 # --------------------------------------------------------------------------- training
 
 
